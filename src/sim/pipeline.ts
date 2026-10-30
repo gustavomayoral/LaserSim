@@ -36,17 +36,28 @@ export interface PipelineResult {
 export interface GpuCapabilities {
   isWebGL2: boolean
   maxTextureSize: number
+  maxRenderbufferSize: number
   colorBufferFloat: boolean
   floatBlend: boolean
+  textureFloatLinear: boolean
+  disjointTimerQuery: boolean
+  renderer: string | null
+  vendor: string | null
 }
 
 export function readGpuCapabilities(renderer: THREE.WebGLRenderer): GpuCapabilities {
   const gl = renderer.getContext()
+  const debugInfo = gl.getExtension("WEBGL_debug_renderer_info")
   return {
     isWebGL2: renderer.capabilities.isWebGL2,
     maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    maxRenderbufferSize: gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
     colorBufferFloat: renderer.extensions.has("EXT_color_buffer_float"),
     floatBlend: renderer.extensions.has("EXT_float_blend"),
+    textureFloatLinear: renderer.extensions.has("OES_texture_float_linear"),
+    disjointTimerQuery: renderer.extensions.has("EXT_disjoint_timer_query_webgl2"),
+    renderer: debugInfo ? (gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) as string) : null,
+    vendor: debugInfo ? (gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) as string) : null,
   }
 }
 

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import { buildTestJob, defaultJobParams, type TestJob } from "./sim/testJob"
-import { BurnSimPipeline, readGpuCapabilities, type GpuCapabilities, type PassTimings } from "./sim/pipeline"
+import { BurnSimPipeline, readGpuCapabilities, type GpuCapabilities } from "./sim/pipeline"
 import { HeightmapScene } from "./render/HeightmapScene"
+import { buildReportText, detectPlatform, type RunSummary } from "./bench/report"
 import "./App.css"
 
 const SIZE_MM = defaultJobParams.sizeMm
@@ -10,11 +11,7 @@ const FULL_GRID = 6000
 const COARSE_GRID = 500
 const GCODE_PORT = 8090
 
-interface RunResult {
-  gridSize: number
-  timings: PassTimings
-  totalFluence: number
-}
+type RunResult = RunSummary
 
 function formatMs(ms: number) {
   return `${ms.toFixed(1)} ms`
@@ -36,6 +33,9 @@ function App() {
   const [gcodeRate, setGcodeRate] = useState<number | null>(null)
   const [gcodeLatencyMs, setGcodeLatencyMs] = useState<number | null>(null)
   const tauriAvailable = isTauri()
+
+  const [benchBusy, setBenchBusy] = useState(false)
+  const [benchStatus, setBenchStatus] = useState<string | null>(null)
 
   useEffect(() => {
     if (!canvasRef.current) return
@@ -98,39 +98,110 @@ function App() {
     return jobsRef.current
   }
 
-  function runPass(kind: "full" | "coarse") {
+  // Runs one pass synchronously and returns its summary; callers decide when
+  // to let the UI paint "busy" first. Throws on pipeline error.
+  function executePass(kind: "full" | "coarse"): RunResult {
     const pipeline = pipelineRef.current
     const scene = sceneRef.current
-    if (!pipeline || !scene) return
+    if (!pipeline || !scene) throw new Error("pipeline not initialized")
+    const gridSize = kind === "full" ? FULL_GRID : COARSE_GRID
+    const maxGrid = caps?.maxTextureSize ?? gridSize
+    const clampedGrid = Math.min(gridSize, maxGrid)
+    const job = kind === "full" ? getJobs().full : getJobs().coarse
+    const result = pipeline.run(job, {
+      sizeMm: SIZE_MM,
+      gridSize: clampedGrid,
+      spotSigmaMm: 0.05,
+      heatSigmaMm: 0.03,
+      // Empirically-tuned visualization "exposure" so cruise-speed fluence
+      // (raw units ~1e-3, since energy = power*dt*absorption with dt in
+      // seconds) lands mid-ramp and only the slowed line-ends go dark.
+      // Not a physical calibration — see "Out of scope" in COD-251.
+      rampScale: 600,
+      ablationThreshold: 0.6,
+    })
+    scene.setTexture(result.renderTarget, result.gridSize)
+    return { gridSize: result.gridSize, timings: result.timings, totalFluence: result.totalFluence }
+  }
+
+  function runPass(kind: "full" | "coarse") {
     setBusy(true)
     setError(null)
     // Let the UI paint "busy" before the (synchronous, blocking) GPU work.
     requestAnimationFrame(() => {
       try {
-        const gridSize = kind === "full" ? FULL_GRID : COARSE_GRID
-        const maxGrid = caps?.maxTextureSize ?? gridSize
-        const clampedGrid = Math.min(gridSize, maxGrid)
-        const job = kind === "full" ? getJobs().full : getJobs().coarse
-        const result = pipeline.run(job, {
-          sizeMm: SIZE_MM,
-          gridSize: clampedGrid,
-          spotSigmaMm: 0.05,
-          heatSigmaMm: 0.03,
-          // Empirically-tuned visualization "exposure" so cruise-speed fluence
-          // (raw units ~1e-3, since energy = power*dt*absorption with dt in
-          // seconds) lands mid-ramp and only the slowed line-ends go dark.
-          // Not a physical calibration — see "Out of scope" in COD-251.
-          rampScale: 600,
-          ablationThreshold: 0.6,
-        })
-        scene.setTexture(result.renderTarget, result.gridSize)
-        const summary: RunResult = { gridSize: result.gridSize, timings: result.timings, totalFluence: result.totalFluence }
+        const summary = executePass(kind)
         if (kind === "full") setFullResult(summary)
         else setCoarseResult(summary)
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
       } finally {
         setBusy(false)
+      }
+    })
+  }
+
+  function runBenchmark() {
+    const scene = sceneRef.current
+    if (!scene || !caps) return
+    setBenchBusy(true)
+    setBenchStatus(null)
+    setError(null)
+    requestAnimationFrame(() => {
+      try {
+        const full = executePass("full")
+        const coarse = executePass("coarse")
+        setFullResult(full)
+        setCoarseResult(coarse)
+
+        const gl = scene.renderer.getContext()
+        const glErrors: string[] = []
+        let glErr = gl.getError()
+        while (glErr !== gl.NO_ERROR) {
+          glErrors.push(`GL error code ${glErr}`)
+          glErr = gl.getError()
+        }
+
+        function expectedFluenceFor(samples: Float32Array) {
+          let sum = 0
+          for (let i = 2; i < samples.length; i += 3) sum += samples[i]
+          return sum
+        }
+        const expectedFluenceFull = expectedFluenceFor(getJobs().full.samples)
+        const expectedFluenceCoarse = expectedFluenceFor(getJobs().coarse.samples)
+
+        const report = buildReportText({
+          caps,
+          full,
+          coarse,
+          expectedFluenceFull,
+          expectedFluenceCoarse,
+          glErrors,
+        })
+
+        if (tauriAvailable) {
+          ;(async () => {
+            try {
+              const { invoke } = await import("@tauri-apps/api/core")
+              const path = await invoke<string>("write_benchmark_report", {
+                platform: detectPlatform(),
+                report,
+              })
+              setBenchStatus(`Report written to ${path}`)
+            } catch (err) {
+              setBenchStatus(`Failed to write report: ${err instanceof Error ? err.message : String(err)}`)
+            } finally {
+              setBenchBusy(false)
+            }
+          })()
+        } else {
+          console.log(report)
+          setBenchStatus("Not running inside Tauri — report logged to the browser console instead of written to disk.")
+          setBenchBusy(false)
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        setBenchBusy(false)
       }
     })
   }
@@ -160,10 +231,30 @@ function App() {
             <li>
               EXT_float_blend: {caps.floatBlend ? "available" : "MISSING — additive deposit blending is unsupported here"}
             </li>
+            <li>Max renderbuffer size: {caps.maxRenderbufferSize}</li>
+            <li>OES_texture_float_linear: {caps.textureFloatLinear ? "available" : "missing"}</li>
+            <li>EXT_disjoint_timer_query_webgl2: {caps.disjointTimerQuery ? "available" : "missing"}</li>
+            <li>GL renderer: {caps.renderer ?? "unavailable"}</li>
+            <li>GL vendor: {caps.vendor ?? "unavailable"}</li>
           </ul>
         ) : (
           <p>probing…</p>
         )}
+      </section>
+
+      <section className="panel">
+        <h2>Benchmark report (COD-252)</h2>
+        <div className="row">
+          <button disabled={benchBusy || busy} onClick={runBenchmark}>
+            Run benchmark
+          </button>
+        </div>
+        <p className="note">
+          Runs the full-res and coarse passes, then writes a plain-text report (environment, capabilities, timings,
+          fluence conservation) to the Desktop. Memory/tiling, CPU fallback, and IPC sections are placeholders until
+          COD-252 §4–§6 land.
+        </p>
+        {benchStatus && <p className="note">{benchStatus}</p>}
       </section>
 
       <section className="panel">

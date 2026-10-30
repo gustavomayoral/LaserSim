@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "send:gcode": "node scripts/send-gcode.mjs",
     "wt:start": "node scripts/worktree.mjs start",
     "wt:finish": "node scripts/worktree.mjs finish",
     "wt:list": "node scripts/worktree.mjs list",

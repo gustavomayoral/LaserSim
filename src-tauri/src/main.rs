@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    lasersim_scaffold_lib::run()
+    lasersim_lib::run()
 }

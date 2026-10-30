@@ -23,11 +23,72 @@
 
 .container {
   margin: 0;
-  padding-top: 10vh;
+  padding: 2vh 2vw 4vh;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  align-items: center;
   text-align: center;
+  gap: 1rem;
+}
+
+.subtitle {
+  max-width: 60ch;
+  opacity: 0.8;
+}
+
+.panel {
+  width: min(900px, 95vw);
+  text-align: left;
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  border-radius: 10px;
+  padding: 1rem 1.5rem;
+}
+
+.panel h2 {
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+
+.panel ul {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+
+.panel table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.panel th,
+.panel td {
+  border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.panel .note {
+  font-size: 0.85rem;
+  opacity: 0.75;
+  margin-top: 0.5rem;
+}
+
+.error {
+  color: #c0392b;
+  font-weight: 500;
+}
+
+.canvas-panel {
+  width: min(900px, 95vw);
+}
+
+.heightmap-canvas {
+  width: 100%;
+  height: 60vh;
+  display: block;
+  border-radius: 8px;
+  cursor: grab;
 }
 
 .logo {

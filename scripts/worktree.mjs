@@ -16,7 +16,7 @@ import { headMatchesStamp, writeStamp, headSha } from './checkStamp.mjs'
 const [command, arg] = process.argv.slice(2)
 
 const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: 'inherit' })
-const read = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+const read = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
 const fail = (message) => {
   process.stderr.write(`wt: ${message}\n`)
   process.exit(1)

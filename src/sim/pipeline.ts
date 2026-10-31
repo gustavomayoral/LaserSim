@@ -36,6 +36,56 @@ export interface PipelineResult {
   timings: PassTimings
   gridSize: number
   totalFluence: number // sum over the grid, for the coarse/full-res consistency check
+  // Only present when run() is called with { diagnose: true }.
+  diagnostics?: StageDiagnostics[]
+}
+
+// Per-stage health check for runs where "no exception and no context loss"
+// isn't proof the stage actually rendered — e.g. the COD-252 §4 memory
+// sweep, where an oversized render target can fail to allocate or come back
+// framebuffer-incomplete and WebGL just records a GL error and draws nothing.
+// framebufferStatus is null for the readback entry (no stage FBO is bound).
+export interface StageDiagnostics {
+  stage: "deposit" | "blurH" | "blurV" | "ramp" | "readback"
+  framebufferStatus: number | null
+  glErrors: number[]
+}
+
+export function drainGlErrors(gl: WebGL2RenderingContext): number[] {
+  const errors: number[] = []
+  // Bounded: a lost context can keep returning CONTEXT_LOST_WEBGL forever.
+  for (let i = 0; i < 32; i++) {
+    const err = gl.getError()
+    if (err === gl.NO_ERROR) break
+    errors.push(err)
+  }
+  return errors
+}
+
+const GL_ERROR_NAMES: Record<number, string> = {
+  0x0500: "INVALID_ENUM",
+  0x0501: "INVALID_VALUE",
+  0x0502: "INVALID_OPERATION",
+  0x0505: "OUT_OF_MEMORY",
+  0x0506: "INVALID_FRAMEBUFFER_OPERATION",
+  0x9242: "CONTEXT_LOST_WEBGL",
+}
+
+const FRAMEBUFFER_STATUS_NAMES: Record<number, string> = {
+  0x8cd5: "COMPLETE",
+  0x8cd6: "INCOMPLETE_ATTACHMENT",
+  0x8cd7: "INCOMPLETE_MISSING_ATTACHMENT",
+  0x8cd9: "INCOMPLETE_DIMENSIONS",
+  0x8cdd: "UNSUPPORTED",
+  0x8d56: "INCOMPLETE_MULTISAMPLE",
+}
+
+export function glErrorName(code: number): string {
+  return `${GL_ERROR_NAMES[code] ?? "UNKNOWN"} (${code})`
+}
+
+export function framebufferStatusName(code: number): string {
+  return `${FRAMEBUFFER_STATUS_NAMES[code] ?? "UNKNOWN"} (0x${code.toString(16)})`
 }
 
 export interface GpuCapabilities {
@@ -113,7 +163,12 @@ export class BurnSimPipeline {
   // future live scrub control) would actually cost, since nothing there
   // would force a synchronous block. Defaults to true (benchmark-correct)
   // for every other caller; see gpuTimer.ts's timeStage.
-  run(job: TestJob, config: PipelineConfig, sync = true): PipelineResult {
+  //
+  // `diagnose = true` records each stage's framebuffer status and the GL
+  // errors raised during it (see StageDiagnostics). Off by default: it adds
+  // a checkFramebufferStatus + getError round-trip per stage, which can
+  // stall the pipeline on some drivers and would skew the timed runs.
+  run(job: TestJob, config: PipelineConfig, sync = true, { diagnose = false } = {}): PipelineResult {
     const renderer = this.renderer
     // renderer.setViewport() always multiplies by the renderer's pixel ratio
     // (see WebGLRenderer.js), even when a render target is bound. The
@@ -129,13 +184,13 @@ export class BurnSimPipeline {
     const previousPixelRatio = renderer.getPixelRatio()
     renderer.setPixelRatio(1)
     try {
-      return this.runAtPixelRatioOne(job, config, sync)
+      return this.runAtPixelRatioOne(job, config, sync, diagnose)
     } finally {
       renderer.setPixelRatio(previousPixelRatio)
     }
   }
 
-  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig, sync: boolean): PipelineResult {
+  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig, sync: boolean, diagnose: boolean): PipelineResult {
     const t0 = performance.now()
     const { sizeMm, gridSize, spotSigmaMm, heatSigmaMm, rampScale, ablationThreshold } = config
     const renderer = this.renderer
@@ -194,6 +249,15 @@ export class BurnSimPipeline {
     const gl = renderer.getContext() as WebGL2RenderingContext
     const timerExt = getTimerExtension(gl)
 
+    // Called right after each stage, while that stage's render target is
+    // still the bound framebuffer (setRenderTarget leaves it bound).
+    const diagnostics: StageDiagnostics[] | undefined = diagnose ? [] : undefined
+    const checkStage = (stage: StageDiagnostics["stage"]) => {
+      if (!diagnostics) return
+      const framebufferStatus = stage === "readback" ? null : gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+      diagnostics.push({ stage, framebufferStatus, glErrors: drainGlErrors(gl) })
+    }
+
     const depositTarget = makeRenderTarget(gridSize)
     const depositTiming = timeStage(gl, timerExt, () => {
       renderer.setRenderTarget(depositTarget)
@@ -202,6 +266,7 @@ export class BurnSimPipeline {
       renderer.clear()
       renderer.render(depositScene, this.orthoCamera)
     }, sync)
+    checkStage("deposit")
 
     // --- separable Gaussian blur ---
     const sigmaTotalMm = Math.sqrt(spotSigmaMm * spotSigmaMm + heatSigmaMm * heatSigmaMm)
@@ -248,6 +313,7 @@ export class BurnSimPipeline {
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(fullscreenSceneH, this.fullscreenCamera)
     }, sync)
+    checkStage("blurH")
 
     const fullscreenMeshV = new THREE.Mesh(FULLSCREEN_GEOMETRY, blurMaterialV)
     const fullscreenSceneV = new THREE.Scene()
@@ -257,6 +323,7 @@ export class BurnSimPipeline {
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(fullscreenSceneV, this.fullscreenCamera)
     }, sync)
+    checkStage("blurV")
 
     // --- material ramp ---
     const rampTarget = new THREE.WebGLRenderTarget(gridSize, gridSize, {
@@ -289,10 +356,12 @@ export class BurnSimPipeline {
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(rampScene, this.fullscreenCamera)
     }, sync)
+    checkStage("ramp")
     renderer.setRenderTarget(null)
     const tEnd = performance.now()
 
     const totalFluence = sumFluenceExact(renderer, blurB, gridSize)
+    checkStage("readback")
 
     // Dispose everything except the ramp target the caller needs to sample.
     geometry.dispose()
@@ -308,6 +377,7 @@ export class BurnSimPipeline {
       renderTarget: rampTarget,
       gridSize,
       totalFluence,
+      diagnostics,
       timings: {
         deposit: depositTiming,
         blurH: blurHTiming,

@@ -741,6 +741,7 @@ function App() {
                 <th>status</th>
                 <th>total</th>
                 <th>est. memory</th>
+                <th>fluence ratio</th>
               </tr>
             </thead>
             <tbody>
@@ -748,9 +749,12 @@ function App() {
                 <tr key={step.sizeMm}>
                   <td>{step.sizeMm}mm</td>
                   <td>{step.gridSize}</td>
-                  <td>{step.contextLost ? "CONTEXT LOST" : step.success ? "OK" : "FAILED"}</td>
+                  <td title={step.problems.join("\n") || undefined}>
+                    {step.contextLost ? "CONTEXT LOST" : step.success ? "OK" : "FAILED"}
+                  </td>
                   <td>{step.totalMs !== null ? formatMs(step.totalMs) : "—"}</td>
                   <td>{(step.estimatedBytes / (1024 * 1024)).toFixed(1)} MB</td>
+                  <td>{step.fluenceRatio !== null ? step.fluenceRatio.toFixed(4) : "—"}</td>
                 </tr>
               ))}
             </tbody>

@@ -8,8 +8,14 @@
 // real numbers instead of a guess.
 
 import * as THREE from "three"
-import { BurnSimPipeline, type PipelineConfig } from "../sim/pipeline"
-import { buildTestJob } from "../sim/testJob"
+import {
+  BurnSimPipeline,
+  drainGlErrors,
+  framebufferStatusName,
+  glErrorName,
+  type PipelineConfig,
+} from "../sim/pipeline"
+import { buildTestJob, type TestJob } from "../sim/testJob"
 
 // Matches the spot sigma used elsewhere in the app (App.tsx's executePass);
 // diode pitch = sigma/3 per COD-252 §4.
@@ -24,6 +30,25 @@ export interface MemorySweepStep {
   error: string | null
   totalMs: number | null
   estimatedBytes: number
+  // Why a step that didn't throw or lose the context still counts as failed:
+  // an incomplete framebuffer or a GL error during any stage, or a fluence
+  // total that doesn't match the job's own deposited energy (e.g. zero
+  // because a target never allocated and nothing was drawn).
+  problems: string[]
+  // GL errors already pending before this step ran (from the on-screen
+  // render loop or an earlier step) — reported, but not held against it.
+  preexistingGlErrors: string[]
+  fluenceRatio: number | null // measured / expected; 1.0 = all energy accounted for
+}
+
+// Same 1% bound COD-252 §3 sets for fluence conservation. A run whose
+// render targets silently failed is off by far more (typically ratio 0).
+const FLUENCE_TOLERANCE = 0.01
+
+function expectedFluence(job: TestJob): number {
+  let sum = 0
+  for (let i = 2; i < job.samples.length; i += 3) sum += job.samples[i]
+  return sum
 }
 
 // deposit + blurA + blurB are RGBA float32 render targets (see pipeline.ts's
@@ -61,22 +86,31 @@ const DEFAULT_SIZES_MM = [100, 150, 200, 250]
 // and timing at each size, and estimated resident texture memory. Stops
 // early if the context is lost, since further GL calls on a lost context
 // are meaningless.
+//
+// "Success" used to mean only "no exception and no context loss", which let
+// oversized steps report OK while WebGL quietly recorded INVALID_ENUM /
+// INVALID_OPERATION / INVALID_FRAMEBUFFER_OPERATION and drew nothing — the
+// first Windows/Iris Xe report showed 250mm (~11 GB est.) as OK, with those
+// errors in its global GL-error list and non-monotonic timings. Each step
+// now runs with per-stage diagnostics and a fluence sanity check.
 export function runMemoryTilingSweep(
   pipeline: BurnSimPipeline,
   renderer: THREE.WebGLRenderer,
   sizesMm: number[] = DEFAULT_SIZES_MM,
 ): MemorySweepStep[] {
   const steps: MemorySweepStep[] = []
-  const gl = renderer.getContext()
+  const gl = renderer.getContext() as WebGL2RenderingContext
 
   for (const sizeMm of sizesMm) {
     const gridSize = Math.round(sizeMm / DIODE_PITCH_MM)
     const estimatedBytes = estimateResidentBytes(gridSize)
 
+    const stepBase = { sizeMm, gridSize, estimatedBytes, problems: [] as string[], preexistingGlErrors: [] as string[], fluenceRatio: null }
     if (gl.isContextLost()) {
-      steps.push({ sizeMm, gridSize, success: false, contextLost: true, error: "context already lost; skipped", totalMs: null, estimatedBytes })
+      steps.push({ ...stepBase, success: false, contextLost: true, error: "context already lost; skipped", totalMs: null })
       continue
     }
+    const preexistingGlErrors = drainGlErrors(gl).map(glErrorName)
 
     const config: PipelineConfig = {
       sizeMm,
@@ -89,29 +123,49 @@ export function runMemoryTilingSweep(
 
     try {
       const job = buildSweepJob(sizeMm, gridSize)
-      const result = pipeline.run(job, config)
+      const result = pipeline.run(job, config, true, { diagnose: true })
       result.renderTarget.dispose()
       const lost = gl.isContextLost()
+
+      const problems: string[] = []
+      for (const d of result.diagnostics ?? []) {
+        if (d.framebufferStatus !== null && d.framebufferStatus !== gl.FRAMEBUFFER_COMPLETE) {
+          problems.push(`${d.stage}: framebuffer ${framebufferStatusName(d.framebufferStatus)}`)
+        }
+        if (d.glErrors.length > 0) {
+          problems.push(`${d.stage}: GL ${d.glErrors.map(glErrorName).join(", ")}`)
+        }
+      }
+      const expected = expectedFluence(job)
+      const fluenceRatio = expected > 0 ? result.totalFluence / expected : null
+      if (fluenceRatio === null || !Number.isFinite(fluenceRatio) || Math.abs(fluenceRatio - 1) > FLUENCE_TOLERANCE) {
+        problems.push(
+          `fluence: measured ${result.totalFluence.toExponential(3)} vs expected ${expected.toExponential(3)}` +
+            (fluenceRatio !== null && Number.isFinite(fluenceRatio) ? ` (ratio ${fluenceRatio.toFixed(4)})` : ""),
+        )
+      }
+
       steps.push({
-        sizeMm,
-        gridSize,
-        success: !lost,
+        ...stepBase,
+        success: !lost && problems.length === 0,
         contextLost: lost,
-        error: lost ? "context lost during run" : null,
+        error: lost ? "context lost during run" : problems.length > 0 ? problems.join("; ") : null,
         totalMs: result.timings.totalMs,
-        estimatedBytes,
+        problems,
+        preexistingGlErrors,
+        fluenceRatio,
       })
       if (lost) break
     } catch (err) {
       const lost = gl.isContextLost()
+      const errors = drainGlErrors(gl).map(glErrorName)
       steps.push({
-        sizeMm,
-        gridSize,
+        ...stepBase,
         success: false,
         contextLost: lost,
-        error: err instanceof Error ? err.message : String(err),
+        error: (err instanceof Error ? err.message : String(err)) + (errors.length > 0 ? ` (GL: ${errors.join(", ")})` : ""),
         totalMs: null,
-        estimatedBytes,
+        preexistingGlErrors,
       })
       if (lost) break
     }

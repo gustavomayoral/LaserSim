@@ -192,20 +192,28 @@ export function buildReportText(inputs: BenchmarkInputs): string {
     lines.push("  not run yet — use the \"Run memory/tiling sweep\" button (COD-252 §4)")
   } else {
     lines.push("  job size sweep at diode pitch (sigma/3 ~= 0.0167mm); estimated bytes = resident deposit/blurA/blurB")
-    lines.push("  (RGBA float32) + ramp (RGBA uint8) render targets at that grid size:")
+    lines.push("  (RGBA float32) + ramp (RGBA uint8) render targets at that grid size.")
+    lines.push("  OK requires: no context loss, every stage's framebuffer COMPLETE, no GL error raised during any")
+    lines.push("  stage or the readback, and the exact fluence sum within 1% of the job's deposited energy.")
     for (const step of memorySweep) {
       const status = step.contextLost ? "CONTEXT LOST" : step.success ? "OK" : "FAILED"
       const timing = step.totalMs !== null ? fmtMs(step.totalMs) : "n/a"
       const mb = (step.estimatedBytes / (1024 * 1024)).toFixed(1)
-      lines.push(
-        `  ${step.sizeMm}mm (grid ${step.gridSize}): ${status}  total=${timing}  est.mem=${mb} MB${
-          step.error ? `  error="${step.error}"` : ""
-        }`,
-      )
+      const ratio = step.fluenceRatio !== null ? step.fluenceRatio.toFixed(4) : "n/a"
+      lines.push(`  ${step.sizeMm}mm (grid ${step.gridSize}): ${status}  total=${timing}  est.mem=${mb} MB  fluence ratio=${ratio}`)
+      for (const problem of step.problems) lines.push(`    problem: ${problem}`)
+      if (step.problems.length === 0 && step.error) lines.push(`    error: ${step.error}`)
+      if (step.preexistingGlErrors.length > 0) {
+        lines.push(`    (GL errors already pending before this step, not counted: ${step.preexistingGlErrors.join(", ")})`)
+      }
     }
-    const largestOk = [...memorySweep].reverse().find((s) => s.success)
+    // Largest size such that it and every smaller step passed — a pass above
+    // a failure would be suspect, not a usable limit.
+    const firstFailure = memorySweep.findIndex((s) => !s.success)
+    const passing = firstFailure === -1 ? memorySweep : memorySweep.slice(0, firstFailure)
+    const largestOk = passing[passing.length - 1]
     lines.push(
-      `  largest untiled size that ran without context loss/failure: ${largestOk ? `${largestOk.sizeMm}mm (grid ${largestOk.gridSize})` : "none"}`,
+      `  largest untiled size with every step up to it passing: ${largestOk ? `${largestOk.sizeMm}mm (grid ${largestOk.gridSize})` : "none"}`,
     )
   }
   lines.push("")

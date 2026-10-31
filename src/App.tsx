@@ -274,7 +274,8 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core")
       const { listen } = await import("@tauri-apps/api/event")
-      await invoke("start_gcode_batched", { port, batchSize: IPC_BATCH_SIZE })
+      // Session and listeners go in before the bind, so a sender that
+      // connects the instant the port opens can't race past them.
       ipcSessionRef.current = {
         mode: "batched-events",
         batchSize: IPC_BATCH_SIZE,
@@ -301,9 +302,17 @@ function App() {
         unlistenDone()
         void finalizeIpcSession()
       })
+      try {
+        await invoke("start_gcode_batched", { port, batchSize: IPC_BATCH_SIZE })
+      } catch (err) {
+        unlistenBatch()
+        unlistenDone()
+        throw err
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log(`IPC batched-events listener FAILED: ${message}`)
+      ipcSessionRef.current = null
       setIpcBusyMode(null)
       setError(message)
     }

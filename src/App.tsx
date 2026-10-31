@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import { buildTestJob, defaultJobParams, type TestJob } from "./sim/testJob"
-import { BurnSimPipeline, readGpuCapabilities, type GpuCapabilities } from "./sim/pipeline"
+import { BurnSimPipeline, readGpuCapabilities, stageTimes, type GpuCapabilities } from "./sim/pipeline"
+import { resolveGpuTimes } from "./sim/gpuTimer"
 import { HeightmapScene } from "./render/HeightmapScene"
 import { buildReportText, type RunSummary, type TimingSeries } from "./bench/report"
 import { runMemoryTilingSweep, type MemorySweepStep } from "./bench/memorySweep"
@@ -114,7 +115,9 @@ function App() {
       setCaps(gpuCaps)
       log(`GPU: ${gpuCaps.renderer ?? "unknown"} (WebGL2: ${gpuCaps.isWebGL2})`)
       log("Warming up shaders...")
-      pipeline.warmup()
+      // One pitch per grid the app runs at (the memory sweep's diode pitch
+      // is the same as full-res's), so every blur variant is precompiled.
+      pipeline.warmup([SIZE_MM / FULL_GRID, SIZE_MM / COARSE_GRID])
       log("Ready.")
     } catch (err) {
       const message = `Startup failed: ${err instanceof Error ? err.message : String(err)}`
@@ -405,9 +408,10 @@ function App() {
     setError(null)
     log(`Running ${kind} pass...`)
     // Let the UI paint "busy" before the (synchronous, blocking) GPU work.
-    requestAnimationFrame(() => {
+    requestAnimationFrame(async () => {
       try {
         const summary = executePass(kind)
+        await resolveGpuTimes(sceneRef.current!.renderer.getContext() as WebGL2RenderingContext, stageTimes(summary.timings))
         if (kind === "full") setFullResult(summary)
         else setCoarseResult(summary)
         log(`${kind} pass done: total ${summary.timings.totalMs.toFixed(1)} ms`)
@@ -444,7 +448,7 @@ function App() {
     setBenchBusy(true)
     setBenchStatus(null)
     setError(null)
-    requestAnimationFrame(() => {
+    requestAnimationFrame(async () => {
       try {
         log("Running full-res pass...")
         const full = executePass("full")
@@ -476,6 +480,13 @@ function App() {
           rampScale: 600,
           ablationThreshold: 0.6,
         })
+
+        // Timer-query results only become readable after yielding to the
+        // event loop (see gpuTimer.ts's timeStage), so every pass above
+        // carries its queries until now.
+        log("Collecting GPU timer-query results...")
+        const timedPasses = [full.timings, coarse.timings, fullSeries.cold, ...fullSeries.warm, coarseSeries.cold, ...coarseSeries.warm]
+        await resolveGpuTimes(scene.renderer.getContext() as WebGL2RenderingContext, timedPasses.flatMap(stageTimes))
 
         log("Running CPU fallback deposit+blur on the full-res job (this can take several seconds)...")
         const fc = fullConfig()

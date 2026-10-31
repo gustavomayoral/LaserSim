@@ -13,8 +13,10 @@ import {
   drainGlErrors,
   framebufferStatusName,
   glErrorName,
+  stageTimes,
   type PipelineConfig,
 } from "../sim/pipeline"
+import { discardGpuTimes } from "../sim/gpuTimer"
 import { buildTestJob, type TestJob } from "../sim/testJob"
 
 // Matches the spot sigma used elsewhere in the app (App.tsx's executePass);
@@ -125,6 +127,7 @@ export function runMemoryTilingSweep(
       const job = buildSweepJob(sizeMm, gridSize)
       const result = pipeline.run(job, config, true, { diagnose: true })
       result.renderTarget.dispose()
+      discardGpuTimes(gl, stageTimes(result.timings))
       const lost = gl.isContextLost()
 
       const problems: string[] = []

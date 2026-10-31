@@ -70,11 +70,20 @@ function runSection(label: string, run: RunSummary | null): string {
     fmtStage("blur H ", run.timings.blurH.wallMs, run.timings.blurH.gpuMs),
     fmtStage("blur V ", run.timings.blurV.wallMs, run.timings.blurV.gpuMs),
     fmtStage("ramp   ", run.timings.ramp.wallMs, run.timings.ramp.gpuMs),
+    `  untimed: ${fmtMs(untimedMs(run.timings))}  (total minus the four stages: setup, allocation, between-stage work)`,
     `  total:   ${fmtMs(run.timings.totalMs)}`,
   ].join("\n")
 }
 
 const STAGES = ["deposit", "blurH", "blurV", "ramp"] as const
+
+// Part of totalMs no stage timer covers. Should be small; the first Windows
+// report had ~200ms here per pass, which turned out to be timeStage
+// busy-waiting on timer queries (see gpuTimer.ts) — reported explicitly so
+// overhead like that can't hide again.
+function untimedMs(t: PassTimings): number {
+  return t.totalMs - STAGES.reduce((sum, stage) => sum + t[stage].wallMs, 0)
+}
 
 // Reports cold (first-run, possibly still paying one-time allocation cost
 // even after pipeline warmup) and min/median/max across `warm` runs per
@@ -90,7 +99,22 @@ function seriesSection(label: string, series: TimingSeries | null): string {
     lines.push(
       `  ${stage.padEnd(7)}: cold=${fmtMs(coldWall)}  warm min/median/max = ${fmtMs(min)} / ${fmtMs(median)} / ${fmtMs(max)}`,
     )
+    const warmGpu = series.warm.map((t) => t[stage].gpuMs).filter((ms): ms is number => ms !== null)
+    if (warmGpu.length > 0) {
+      const gpu = minMaxMedian(warmGpu)
+      const coldGpu = series.cold[stage].gpuMs
+      lines.push(
+        `  ${"".padEnd(7)}  gpu: cold=${coldGpu !== null ? fmtMs(coldGpu) : "n/a"}  warm min/median/max = ${fmtMs(gpu.min)} / ${fmtMs(gpu.median)} / ${fmtMs(gpu.max)}` +
+          (warmGpu.length < series.warm.length ? `  (${warmGpu.length}/${series.warm.length} warm runs resolved)` : ""),
+      )
+    } else {
+      lines.push(`  ${"".padEnd(7)}  gpu: unavailable`)
+    }
   }
+  const warmUntimed = minMaxMedian(series.warm.map(untimedMs))
+  lines.push(
+    `  untimed: cold=${fmtMs(untimedMs(series.cold))}  warm min/median/max = ${fmtMs(warmUntimed.min)} / ${fmtMs(warmUntimed.median)} / ${fmtMs(warmUntimed.max)}`,
+  )
   const warmTotal = series.warm.map((t) => t.totalMs)
   const { min, median, max } = minMaxMedian(warmTotal)
   lines.push(`  total  : cold=${fmtMs(series.cold.totalMs)}  warm min/median/max = ${fmtMs(min)} / ${fmtMs(median)} / ${fmtMs(max)}`)
@@ -145,7 +169,9 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push("== Timings ==")
   lines.push("method: each stage is synced before its wall-clock end is taken (gl.finish() + 1px readPixels — see")
   lines.push("gpuTimer.ts), so wall times reflect completed GPU work, not just submission (COD-252 §2). gpu= times")
-  lines.push("come from EXT_disjoint_timer_query_webgl2 when available (null otherwise — see Capabilities above).")
+  lines.push("come from EXT_disjoint_timer_query_webgl2 when available, read back after the runs finish (WebGL only")
+  lines.push("exposes query results once control returns to the event loop); unavailable if the extension is missing")
+  lines.push("or the driver reported a disjoint event.")
   lines.push("Shaders are warmed up once at pipeline construction, before any of the runs below.")
   lines.push("")
   lines.push(runSection("Full-res (single run, shown in UI)", full))

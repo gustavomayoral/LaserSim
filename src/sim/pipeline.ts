@@ -7,7 +7,7 @@ import {
   rampFragment,
 } from "./shaders"
 import type { TestJob } from "./testJob"
-import { getTimerExtension, timeStage, type StageTime } from "./gpuTimer"
+import { discardGpuTimes, getTimerExtension, timeStage, type StageTime } from "./gpuTimer"
 
 export interface PipelineConfig {
   sizeMm: number
@@ -27,6 +27,11 @@ export interface PassTimings {
   blurV: StageTime
   ramp: StageTime
   totalMs: number // wall-clock across all stages, sync included
+}
+
+// The four stage times of a pass, e.g. to hand to resolveGpuTimes().
+export function stageTimes(timings: PassTimings): StageTime[] {
+  return [timings.deposit, timings.blurH, timings.blurV, timings.ramp]
 }
 
 export interface PipelineResult {
@@ -392,22 +397,37 @@ export class BurnSimPipeline {
   // first "real" run's timings aren't dominated by one-time shader
   // compilation/link cost (COD-252 §2). Call once after construction,
   // before any timed run.
-  warmup(): void {
-    const tinyJob: TestJob = {
-      samples: new Float32Array([0, 0, 1e-6, 1, 1, 1e-6]),
-      sampleCount: 2,
-      lineCount: 1,
-      samplesPerLine: 2,
+  //
+  // The blur fragment shader is generated per kernel radius, and the radius
+  // depends on grid pitch, so each pitch the app will run at needs its own
+  // warm-up: a single fixed 1mm/8-texel job (radius 2) warmed neither the
+  // full-res (radius 11) nor the coarse (radius 1) blur. Each pitch is
+  // warmed on an 8x8 grid at that same pitch — same radius, same compiled
+  // program, negligible GPU cost. (Not the cause of the slow first coarse
+  // blur H after a full-res pass on Windows/Iris Xe — ~100-290ms wall at
+  // ~0.2ms GPU — which persists with this warm-up; see COD-252.)
+  warmup(pitchesMm: number[] = [0.125]): void {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext
+    const warmGrid = 8
+    for (const pitchMm of pitchesMm) {
+      const sizeMm = pitchMm * warmGrid
+      const tinyJob: TestJob = {
+        samples: new Float32Array([0, 0, 1e-6, sizeMm, sizeMm, 1e-6]),
+        sampleCount: 2,
+        lineCount: 1,
+        samplesPerLine: 2,
+      }
+      const result = this.run(tinyJob, {
+        sizeMm,
+        gridSize: warmGrid,
+        spotSigmaMm: 0.05,
+        heatSigmaMm: 0.03,
+        rampScale: 600,
+        ablationThreshold: 0.6,
+      })
+      result.renderTarget.dispose()
+      discardGpuTimes(gl, stageTimes(result.timings))
     }
-    const result = this.run(tinyJob, {
-      sizeMm: 1,
-      gridSize: 8,
-      spotSigmaMm: 0.05,
-      heatSigmaMm: 0.03,
-      rampScale: 600,
-      ablationThreshold: 0.6,
-    })
-    result.renderTarget.dispose()
   }
 
   // Runs one cold pass (reported separately — it may still carry residual

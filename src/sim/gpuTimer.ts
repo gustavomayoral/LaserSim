@@ -12,8 +12,12 @@ export interface StageTime {
   wallMs: number
   // null when EXT_disjoint_timer_query_webgl2 is unavailable, the query
   // result never became available, or the driver reported a disjoint event
-  // (timing invalidated by a GPU state change mid-query).
+  // (timing invalidated by a GPU state change mid-query). Also null until
+  // resolveGpuTimes() has run — see timeStage.
   gpuMs: number | null
+  // Timer query still waiting for its result; consumed (and deleted) by
+  // resolveGpuTimes().
+  pendingQuery?: WebGLQuery
 }
 
 // EXT_disjoint_timer_query_webgl2 only adds the TIME_ELAPSED_EXT/
@@ -78,8 +82,6 @@ export function gpuSync(gl: WebGL2RenderingContext): void {
   }
 }
 
-const QUERY_POLL_TIMEOUT_MS = 50
-
 // Times one GPU stage: begins a timer query (if the extension is available),
 // runs `render` (which issues the stage's draw call(s)), ends the query, then
 // syncs the GPU and takes the wall-clock end. The query's begin/end window
@@ -94,6 +96,16 @@ const QUERY_POLL_TIMEOUT_MS = 50
 // (e.g. a future live scrub control) would actually pay, since nothing
 // forces the pipeline to synchronously block there. Call sites must label
 // which one they're reporting; see report.ts.
+//
+// The timer query's result is NOT read here. WebGL only makes query results
+// available after control returns to the browser's event loop (WebGL 2
+// spec §5.32), so this used to busy-wait its full 50ms poll timeout on
+// every stage and still get nothing: every report showed gpu=unavailable,
+// and the 4 x 50ms of spinning was ~200ms of every pass's totalMs that no
+// stage timer covered (the "missing" coarse-scrub time in the first
+// Windows report). The query now rides along on the returned StageTime;
+// call resolveGpuTimes() from an async context once the batch of runs is
+// done.
 export function timeStage(
   gl: WebGL2RenderingContext,
   ext: TimerExt | null,
@@ -115,24 +127,46 @@ export function timeStage(
   gpuSync(gl)
   const wallMs = performance.now() - t0
 
-  let gpuMs: number | null = null
-  if (ext && query) {
-    const pollStart = performance.now()
-    while (performance.now() - pollStart < QUERY_POLL_TIMEOUT_MS) {
-      if (gl.getParameter(ext.GPU_DISJOINT_EXT)) {
-        gpuMs = null
-        break
-      }
-      if (gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) {
-        const ns = gl.getQueryParameter(query, gl.QUERY_RESULT) as number
-        gpuMs = ns / 1e6
-        break
-      }
-    }
-    gl.deleteQuery(query)
-  }
+  return query ? { wallMs, gpuMs: null, pendingQuery: query } : { wallMs, gpuMs: null }
+}
 
-  return { wallMs, gpuMs }
+const QUERY_RESOLVE_TIMEOUT_MS = 2000
+
+// Fills in gpuMs for every StageTime whose timer query is still pending,
+// yielding to the event loop between polls (results can't become available
+// otherwise). A disjoint event invalidates every query still outstanding,
+// so those stay null. Always deletes the queries it was given.
+export async function resolveGpuTimes(gl: WebGL2RenderingContext, stages: StageTime[]): Promise<void> {
+  const ext = getTimerExtension(gl)
+  let pending = stages.filter((s) => s.pendingQuery)
+  const start = performance.now()
+  while (pending.length > 0 && ext && performance.now() - start < QUERY_RESOLVE_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, 0))
+    if (gl.getParameter(ext.GPU_DISJOINT_EXT)) break
+    pending = pending.filter((s) => {
+      const query = s.pendingQuery!
+      if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) return true
+      s.gpuMs = (gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6
+      gl.deleteQuery(query)
+      delete s.pendingQuery
+      return false
+    })
+  }
+  for (const s of pending) {
+    gl.deleteQuery(s.pendingQuery!)
+    delete s.pendingQuery
+  }
+}
+
+// For runs whose GPU times nobody will read (warmup, the memory sweep):
+// frees their queries without waiting.
+export function discardGpuTimes(gl: WebGL2RenderingContext, stages: StageTime[]): void {
+  for (const s of stages) {
+    if (s.pendingQuery) {
+      gl.deleteQuery(s.pendingQuery)
+      delete s.pendingQuery
+    }
+  }
 }
 
 export function median(values: number[]): number {

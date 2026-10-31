@@ -93,4 +93,25 @@ describe("runCpuReference", () => {
     expect(Math.abs(result.afterBlurH / expected - 1)).toBeLessThan(0.01)
     expect(Math.abs(result.afterBlurV / expected - 1)).toBeLessThan(0.01)
   })
+
+  // The app's actual coarse-scrub job (App.tsx's getJobs().coarse) isn't
+  // defaultJobParams resampled onto a smaller grid — it rebuilds the job
+  // with gridPitchMm set to match the coarse grid pitch exactly
+  // (SIZE_MM / COARSE_GRID), so every line has only ~500 samples instead of
+  // ~6000. The test above kept the full-res sample pitch, which never
+  // exercised this: with the real coarse sample pitch, each line's very
+  // first/last sample lands exactly on the domain edge — the same case the
+  // GPU shader had to be fixed for (see shaders.ts's depositVertex) — and
+  // without that fix this failed by several percent, not fractions of one.
+  it("conserves fluence within 1% for the app's actual coarse-scrub job (sample pitch == grid pitch)", () => {
+    const coarseGrid = 500
+    const job = buildTestJob({ ...defaultJobParams, gridPitchMm: defaultJobParams.sizeMm / coarseGrid })
+    const expected = expectedEnergy(job.samples)
+    const sigmaTotalMm = Math.sqrt(0.05 ** 2 + 0.03 ** 2)
+    const result = runCpuReference(job, defaultJobParams.sizeMm, coarseGrid, sigmaTotalMm)
+
+    expect(Math.abs(result.afterDeposit / expected - 1)).toBeLessThan(0.01)
+    expect(Math.abs(result.afterBlurH / expected - 1)).toBeLessThan(0.01)
+    expect(Math.abs(result.afterBlurV / expected - 1)).toBeLessThan(0.01)
+  })
 })

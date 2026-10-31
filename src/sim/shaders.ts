@@ -33,6 +33,36 @@ void main() {
   vec2 pixelPos = (aCenter / uDomainMm) * uGridSize;
   vec2 i0 = floor(pixelPos - 0.5);
   vFrac = pixelPos - (i0 + 0.5);
+  // i0 (or i0+1) falls outside [0, gridSize) whenever a sample sits within
+  // one texel of the domain edge — which includes every raster line's exact
+  // first/last sample, since this job's sample pitch equals the grid pitch.
+  // Left as-is, that half of the quad lands off the render target and the
+  // viewport silently clips it: real energy dropped, not deposited, worst
+  // for end-of-line samples (the velocity floor makes them the highest-
+  // energy samples on the line) and worst proportionally on coarse grids
+  // (fewer samples/line to dilute the loss) — this was COD-252's
+  // platform/resolution-dependent fluence loss ("samples clipped at the
+  // viewport edge" from the issue's own suspect list). The CPU reference
+  // (cpuReference.ts's cpuDeposit) avoids it by clamping each corner's texel
+  // index into range, which folds an edge sample's full weight onto the one
+  // valid texel it's touching instead of discarding the invalid half. Match
+  // that here: when one corner would be invalid, pin i0 to the valid pair
+  // and force vFrac to put 100% of this axis's weight on the texel that
+  // exists.
+  if (i0.x < 0.0) {
+    i0.x = 0.0;
+    vFrac.x = 0.0;
+  } else if (i0.x > uGridSize.x - 2.0) {
+    i0.x = uGridSize.x - 2.0;
+    vFrac.x = 1.0;
+  }
+  if (i0.y < 0.0) {
+    i0.y = 0.0;
+    vFrac.y = 0.0;
+  } else if (i0.y > uGridSize.y - 2.0) {
+    i0.y = uGridSize.y - 2.0;
+    vFrac.y = 1.0;
+  }
   // The quad spans texel i0 to i0+2 (i.e. the 2 texels this sample's
   // bilinear splat covers on this axis); "position" (0 or 1 per axis) picks
   // which corner of that quad this vertex is.

@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod gcode_listener;
+mod ipc_bench;
 
 use tauri::Manager;
 
@@ -30,7 +31,13 @@ fn write_benchmark_report(app: tauri::AppHandle, platform: String, report: Strin
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, write_benchmark_report])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            write_benchmark_report,
+            ipc_bench::start_gcode_batched,
+            ipc_bench::start_gcode_channel,
+            ipc_bench::ping
+        ])
         .setup(|app| {
             gcode_listener::spawn(app.handle().clone(), gcode_listener::DEFAULT_PORT);
             Ok(())

@@ -99,17 +99,48 @@ export function runCpuReference(
   gridSize: number,
   sigmaTotalMm: number,
 ): CpuReferenceResult {
+  return runCpuReferenceTimed(job, sizeMm, gridSize, sigmaTotalMm).result
+}
+
+export interface CpuReferenceTimedResult {
+  result: CpuReferenceResult
+  depositMs: number
+  blurHMs: number
+  blurVMs: number
+  totalMs: number
+}
+
+// Same as runCpuReference, but also times each stage with performance.now()
+// — used for the CPU-fallback cost measurement (COD-252 §5): this is the
+// path EXT_float_blend-less GPUs (or a from-scratch headless run) would pay,
+// so its cost needs to be known even on machines where the GPU path works.
+export function runCpuReferenceTimed(
+  job: TestJob,
+  sizeMm: number,
+  gridSize: number,
+  sigmaTotalMm: number,
+): CpuReferenceTimedResult {
   const pitchMm = sizeMm / gridSize
   const sigmaTexels = Math.max(sigmaTotalMm / pitchMm, 1e-3)
 
+  const t0 = performance.now()
   const deposited = cpuDeposit(job, sizeMm, gridSize)
+  const t1 = performance.now()
   const afterDeposit = sumGrid(deposited)
 
   const blurredH = cpuBlurPass(deposited, gridSize, sigmaTexels, "x")
+  const t2 = performance.now()
   const afterBlurH = sumGrid(blurredH)
 
   const blurredV = cpuBlurPass(blurredH, gridSize, sigmaTexels, "y")
+  const t3 = performance.now()
   const afterBlurV = sumGrid(blurredV)
 
-  return { afterDeposit, afterBlurH, afterBlurV }
+  return {
+    result: { afterDeposit, afterBlurH, afterBlurV },
+    depositMs: t1 - t0,
+    blurHMs: t2 - t1,
+    blurVMs: t3 - t2,
+    totalMs: t3 - t0,
+  }
 }

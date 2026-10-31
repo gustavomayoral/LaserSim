@@ -7,6 +7,7 @@ import {
   rampFragment,
 } from "./shaders"
 import type { TestJob } from "./testJob"
+import { getTimerExtension, timeStage, type StageTime } from "./gpuTimer"
 
 export interface PipelineConfig {
   sizeMm: number
@@ -17,11 +18,15 @@ export interface PipelineConfig {
   ablationThreshold: number // normalized 0..1, after rampScale
 }
 
+// Each stage's time is taken only after a GPU sync (COD-252 §2) — see
+// gpuTimer.ts. gpuMs is null when EXT_disjoint_timer_query_webgl2 is
+// unavailable or its result didn't resolve.
 export interface PassTimings {
-  depositMs: number
-  blurMs: number
-  rampMs: number
-  totalMs: number
+  deposit: StageTime
+  blurH: StageTime
+  blurV: StageTime
+  ramp: StageTime
+  totalMs: number // wall-clock across all stages, sync included
 }
 
 export interface PipelineResult {
@@ -180,13 +185,17 @@ export class BurnSimPipeline {
     this.orthoCamera.bottom = 0
     this.orthoCamera.updateProjectionMatrix()
 
+    const gl = renderer.getContext() as WebGL2RenderingContext
+    const timerExt = getTimerExtension(gl)
+
     const depositTarget = makeRenderTarget(gridSize)
-    renderer.setRenderTarget(depositTarget)
-    renderer.setViewport(0, 0, gridSize, gridSize)
-    renderer.setClearColor(0x000000, 0)
-    renderer.clear()
-    renderer.render(depositScene, this.orthoCamera)
-    const tDeposit = performance.now()
+    const depositTiming = timeStage(gl, timerExt, () => {
+      renderer.setRenderTarget(depositTarget)
+      renderer.setViewport(0, 0, gridSize, gridSize)
+      renderer.setClearColor(0x000000, 0)
+      renderer.clear()
+      renderer.render(depositScene, this.orthoCamera)
+    })
 
     // --- separable Gaussian blur ---
     const sigmaTotalMm = Math.sqrt(spotSigmaMm * spotSigmaMm + heatSigmaMm * heatSigmaMm)
@@ -233,17 +242,20 @@ export class BurnSimPipeline {
     const fullscreenMeshH = new THREE.Mesh(FULLSCREEN_GEOMETRY, blurMaterialH)
     const fullscreenSceneH = new THREE.Scene()
     fullscreenSceneH.add(fullscreenMeshH)
-    renderer.setRenderTarget(blurA)
-    renderer.setViewport(0, 0, gridSize, gridSize)
-    renderer.render(fullscreenSceneH, this.fullscreenCamera)
+    const blurHTiming = timeStage(gl, timerExt, () => {
+      renderer.setRenderTarget(blurA)
+      renderer.setViewport(0, 0, gridSize, gridSize)
+      renderer.render(fullscreenSceneH, this.fullscreenCamera)
+    })
 
     const fullscreenMeshV = new THREE.Mesh(FULLSCREEN_GEOMETRY, blurMaterialV)
     const fullscreenSceneV = new THREE.Scene()
     fullscreenSceneV.add(fullscreenMeshV)
-    renderer.setRenderTarget(blurB)
-    renderer.setViewport(0, 0, gridSize, gridSize)
-    renderer.render(fullscreenSceneV, this.fullscreenCamera)
-    const tBlur = performance.now()
+    const blurVTiming = timeStage(gl, timerExt, () => {
+      renderer.setRenderTarget(blurB)
+      renderer.setViewport(0, 0, gridSize, gridSize)
+      renderer.render(fullscreenSceneV, this.fullscreenCamera)
+    })
 
     // --- material ramp ---
     const rampTarget = new THREE.WebGLRenderTarget(gridSize, gridSize, {
@@ -271,11 +283,13 @@ export class BurnSimPipeline {
     const rampMesh = new THREE.Mesh(FULLSCREEN_GEOMETRY, rampMaterial)
     const rampScene = new THREE.Scene()
     rampScene.add(rampMesh)
-    renderer.setRenderTarget(rampTarget)
-    renderer.setViewport(0, 0, gridSize, gridSize)
-    renderer.render(rampScene, this.fullscreenCamera)
+    const rampTiming = timeStage(gl, timerExt, () => {
+      renderer.setRenderTarget(rampTarget)
+      renderer.setViewport(0, 0, gridSize, gridSize)
+      renderer.render(rampScene, this.fullscreenCamera)
+    })
     renderer.setRenderTarget(null)
-    const tRamp = performance.now()
+    const tEnd = performance.now()
 
     const totalFluence = sumFluenceExact(renderer, blurB, gridSize)
 
@@ -294,12 +308,53 @@ export class BurnSimPipeline {
       gridSize,
       totalFluence,
       timings: {
-        depositMs: tDeposit - t0,
-        blurMs: tBlur - tDeposit,
-        rampMs: tRamp - tBlur,
-        totalMs: tRamp - t0,
+        deposit: depositTiming,
+        blurH: blurHTiming,
+        blurV: blurVTiming,
+        ramp: rampTiming,
+        totalMs: tEnd - t0,
       },
     }
+  }
+
+  // Compiles and runs every shader once on a throwaway tiny job, so the
+  // first "real" run's timings aren't dominated by one-time shader
+  // compilation/link cost (COD-252 §2). Call once after construction,
+  // before any timed run.
+  warmup(): void {
+    const tinyJob: TestJob = {
+      samples: new Float32Array([0, 0, 1e-6, 1, 1, 1e-6]),
+      sampleCount: 2,
+      lineCount: 1,
+      samplesPerLine: 2,
+    }
+    const result = this.run(tinyJob, {
+      sizeMm: 1,
+      gridSize: 8,
+      spotSigmaMm: 0.05,
+      heatSigmaMm: 0.03,
+      rampScale: 600,
+      ablationThreshold: 0.6,
+    })
+    result.renderTarget.dispose()
+  }
+
+  // Runs one cold pass (reported separately — it may still carry residual
+  // one-time cost even after warmup(), e.g. render-target allocation the
+  // driver hasn't seen at this exact size before) followed by `warmRuns`
+  // additional passes whose timings are meant to be aggregated as
+  // min/median/max (COD-252 §1/§2). Each run's render target is disposed
+  // immediately since only timings are needed here.
+  runSeries(job: TestJob, config: PipelineConfig, warmRuns = 10): { cold: PassTimings; warm: PassTimings[] } {
+    const coldRun = this.run(job, config)
+    coldRun.renderTarget.dispose()
+    const warm: PassTimings[] = []
+    for (let i = 0; i < warmRuns; i++) {
+      const result = this.run(job, config)
+      result.renderTarget.dispose()
+      warm.push(result.timings)
+    }
+    return { cold: coldRun.timings, warm }
   }
 }
 

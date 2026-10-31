@@ -1,9 +1,18 @@
 import type { GpuCapabilities, PassTimings } from "../sim/pipeline"
+import { minMaxMedian } from "../sim/gpuTimer"
+import type { MemorySweepStep } from "./memorySweep"
+import type { CpuFallbackResult } from "./cpuFallback"
+import type { IpcModeResult } from "./ipcBench"
 
 export interface RunSummary {
   gridSize: number
   timings: PassTimings
   totalFluence: number
+}
+
+export interface TimingSeries {
+  cold: PassTimings
+  warm: PassTimings[]
 }
 
 export interface BenchmarkInputs {
@@ -13,6 +22,11 @@ export interface BenchmarkInputs {
   expectedFluenceFull: number
   expectedFluenceCoarse: number
   glErrors: string[]
+  fullSeries: TimingSeries | null
+  coarseSeries: TimingSeries | null
+  memorySweep: MemorySweepStep[] | null
+  cpuFallback: CpuFallbackResult | null
+  ipcResults: IpcModeResult[] | null
 }
 
 // Coarse platform label for the report filename/header. No OS plugin is wired
@@ -30,6 +44,11 @@ function fmtMs(ms: number) {
   return `${ms.toFixed(2)} ms`
 }
 
+function fmtStage(label: string, wallMs: number, gpuMs: number | null): string {
+  const gpuPart = gpuMs !== null ? `gpu=${fmtMs(gpuMs)}` : "gpu=unavailable"
+  return `  ${label}: wall=${fmtMs(wallMs)} ${gpuPart}`
+}
+
 function fluenceRow(label: string, expected: number, measured: number | null): string {
   if (measured === null) return `  ${label}: not instrumented yet (pending COD-252 §3 CPU reference implementation)`
   const ratio = expected !== 0 ? measured / expected : NaN
@@ -43,11 +62,35 @@ function runSection(label: string, run: RunSummary | null): string {
   if (!run) return `${label}: not run`
   return [
     `${label} (grid ${run.gridSize}x${run.gridSize}):`,
-    `  deposit: ${fmtMs(run.timings.depositMs)}`,
-    `  blur:    ${fmtMs(run.timings.blurMs)}`,
-    `  ramp:    ${fmtMs(run.timings.rampMs)}`,
+    fmtStage("deposit", run.timings.deposit.wallMs, run.timings.deposit.gpuMs),
+    fmtStage("blur H ", run.timings.blurH.wallMs, run.timings.blurH.gpuMs),
+    fmtStage("blur V ", run.timings.blurV.wallMs, run.timings.blurV.gpuMs),
+    fmtStage("ramp   ", run.timings.ramp.wallMs, run.timings.ramp.gpuMs),
     `  total:   ${fmtMs(run.timings.totalMs)}`,
   ].join("\n")
+}
+
+const STAGES = ["deposit", "blurH", "blurV", "ramp"] as const
+
+// Reports cold (first-run, possibly still paying one-time allocation cost
+// even after pipeline warmup) and min/median/max across `warm` runs per
+// stage (COD-252 §1/§2).
+function seriesSection(label: string, series: TimingSeries | null): string {
+  if (!series) return `${label}: not run`
+  const lines = [`${label} (${series.warm.length} warm runs after 1 cold run):`]
+  lines.push(`  cold total: ${fmtMs(series.cold.totalMs)}`)
+  for (const stage of STAGES) {
+    const coldWall = series.cold[stage].wallMs
+    const warmWall = series.warm.map((t) => t[stage].wallMs)
+    const { min, median, max } = minMaxMedian(warmWall)
+    lines.push(
+      `  ${stage.padEnd(7)}: cold=${fmtMs(coldWall)}  warm min/median/max = ${fmtMs(min)} / ${fmtMs(median)} / ${fmtMs(max)}`,
+    )
+  }
+  const warmTotal = series.warm.map((t) => t.totalMs)
+  const { min, median, max } = minMaxMedian(warmTotal)
+  lines.push(`  total  : cold=${fmtMs(series.cold.totalMs)}  warm min/median/max = ${fmtMs(min)} / ${fmtMs(median)} / ${fmtMs(max)}`)
+  return lines.join("\n")
 }
 
 // Builds the plain-text benchmark report described in COD-252 §1. Sections
@@ -56,7 +99,19 @@ function runSection(label: string, run: RunSummary | null): string {
 // than fabricated numbers, so partial reports are honest about what they
 // cover until COD-252 §2/§4/§5/§6 land.
 export function buildReportText(inputs: BenchmarkInputs): string {
-  const { caps, full, coarse, expectedFluenceFull, expectedFluenceCoarse, glErrors } = inputs
+  const {
+    caps,
+    full,
+    coarse,
+    expectedFluenceFull,
+    expectedFluenceCoarse,
+    glErrors,
+    fullSeries,
+    coarseSeries,
+    memorySweep,
+    cpuFallback,
+    ipcResults,
+  } = inputs
   const now = new Date()
 
   const lines: string[] = []
@@ -83,12 +138,18 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push("")
 
   lines.push("== Timings ==")
-  lines.push("method: performance.now() wall-clock around renderer.render() calls, single run (no warm-up series,")
-  lines.push("no GPU sync via gl.finish()/readPixels yet — see COD-252 §2, numbers below measure submission only).")
+  lines.push("method: each stage is synced before its wall-clock end is taken (gl.finish() + 1px readPixels — see")
+  lines.push("gpuTimer.ts), so wall times reflect completed GPU work, not just submission (COD-252 §2). gpu= times")
+  lines.push("come from EXT_disjoint_timer_query_webgl2 when available (null otherwise — see Capabilities above).")
+  lines.push("Shaders are warmed up once at pipeline construction, before any of the runs below.")
   lines.push("")
-  lines.push(runSection("Full-res", full))
+  lines.push(runSection("Full-res (single run, shown in UI)", full))
   lines.push("")
-  lines.push(runSection("Coarse scrub", coarse))
+  lines.push(runSection("Coarse scrub (single run, shown in UI)", coarse))
+  lines.push("")
+  lines.push(seriesSection("Full-res series", fullSeries))
+  lines.push("")
+  lines.push(seriesSection("Coarse scrub series", coarseSeries))
   lines.push("")
 
   lines.push("== Fluence conservation ==")
@@ -105,15 +166,57 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push("")
 
   lines.push("== GPU memory and tiling ==")
-  lines.push("  not yet implemented — pending COD-252 §4 (job-size sweep + resident-texture accounting)")
+  if (!memorySweep || memorySweep.length === 0) {
+    lines.push("  not run yet — use the \"Run memory/tiling sweep\" button (COD-252 §4)")
+  } else {
+    lines.push("  job size sweep at diode pitch (sigma/3 ~= 0.0167mm); estimated bytes = resident deposit/blurA/blurB")
+    lines.push("  (RGBA float32) + ramp (RGBA uint8) render targets at that grid size:")
+    for (const step of memorySweep) {
+      const status = step.contextLost ? "CONTEXT LOST" : step.success ? "OK" : "FAILED"
+      const timing = step.totalMs !== null ? fmtMs(step.totalMs) : "n/a"
+      const mb = (step.estimatedBytes / (1024 * 1024)).toFixed(1)
+      lines.push(
+        `  ${step.sizeMm}mm (grid ${step.gridSize}): ${status}  total=${timing}  est.mem=${mb} MB${
+          step.error ? `  error="${step.error}"` : ""
+        }`,
+      )
+    }
+    const largestOk = [...memorySweep].reverse().find((s) => s.success)
+    lines.push(
+      `  largest untiled size that ran without context loss/failure: ${largestOk ? `${largestOk.sizeMm}mm (grid ${largestOk.gridSize})` : "none"}`,
+    )
+  }
   lines.push("")
 
   lines.push("== CPU fallback ==")
-  lines.push("  not yet implemented — pending COD-252 §5")
+  if (!cpuFallback) {
+    lines.push("  not run yet — included automatically when \"Run benchmark\" completes (COD-252 §5)")
+  } else {
+    lines.push(`  full-res CPU deposit+blur (grid ${cpuFallback.gridSize}x${cpuFallback.gridSize}), run whether or not`)
+    lines.push("  EXT_float_blend is present, so the fallback cost is always known:")
+    lines.push(`  deposit: ${fmtMs(cpuFallback.depositMs)}`)
+    lines.push(`  blur H:  ${fmtMs(cpuFallback.blurHMs)}`)
+    lines.push(`  blur V:  ${fmtMs(cpuFallback.blurVMs)}`)
+    lines.push(`  total:   ${fmtMs(cpuFallback.totalMs)}`)
+  }
   lines.push("")
 
   lines.push("== IPC ==")
-  lines.push("  not yet implemented — pending COD-252 §6 (batched streaming + status-query latency under load)")
+  if (!ipcResults || ipcResults.length === 0) {
+    lines.push("  not run yet — use the IPC benchmark panel (COD-252 §6): stream 50k lines from")
+    lines.push("  `node scripts/send-gcode.mjs` against each listed mode, and run the status-query RTT check")
+    lines.push("  while a stream is in flight.")
+  } else {
+    for (const r of ipcResults) {
+      lines.push(`  ${r.mode} (batch size ${r.batchSize}, port ${r.port}):`)
+      lines.push(`    lines: ${r.lineCount}  duration: ${fmtMs(r.durationMs)}  throughput: ${r.linesPerSec.toFixed(0)} lines/sec`)
+      lines.push(`    latency p50: ${fmtMs(r.latencyP50Ms)}  p95: ${fmtMs(r.latencyP95Ms)}`)
+      if (r.statusRttWhileStreamingMs) {
+        const { p50, p95 } = r.statusRttWhileStreamingMs
+        lines.push(`    status-query RTT while streaming: p50=${fmtMs(p50)} p95=${fmtMs(p95)}`)
+      }
+    }
+  }
   lines.push("")
 
   lines.push("== GL errors / warnings ==")

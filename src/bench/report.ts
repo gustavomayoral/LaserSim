@@ -27,6 +27,10 @@ export interface BenchmarkInputs {
   memorySweep: MemorySweepStep[] | null
   cpuFallback: CpuFallbackResult | null
   ipcResults: IpcModeResult[] | null
+  // Unsynced (submission-time-only) coarse-scrub total, as an estimate of
+  // what real interactive use would cost — NOT comparable to the synced
+  // numbers above. See pipeline.ts's run() `sync` param.
+  coarseUnsyncedTotalMs: number | null
 }
 
 // Coarse platform label for the report filename/header. No OS plugin is wired
@@ -111,6 +115,7 @@ export function buildReportText(inputs: BenchmarkInputs): string {
     memorySweep,
     cpuFallback,
     ipcResults,
+    coarseUnsyncedTotalMs,
   } = inputs
   const now = new Date()
 
@@ -150,6 +155,23 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push(seriesSection("Full-res series", fullSeries))
   lines.push("")
   lines.push(seriesSection("Coarse scrub series", coarseSeries))
+  lines.push("")
+  if (coarseUnsyncedTotalMs !== null) {
+    lines.push(
+      `Coarse scrub, UNSYNCED (interactive-use estimate, NOT GPU-complete — see pipeline.ts's run() sync param): ${fmtMs(
+        coarseUnsyncedTotalMs,
+      )}`,
+    )
+    lines.push(
+      "  this is submission time only (COD-251's original method); real interactive use (e.g. a live scrub",
+    )
+    lines.push(
+      "  control) wouldn't force the synchronous gl.finish()/readPixels the benchmark numbers above need for",
+    )
+    lines.push("  correctness, so this is the number closer to what that would actually feel like.")
+  } else {
+    lines.push("Coarse scrub, UNSYNCED (interactive-use estimate): not measured this run")
+  }
   lines.push("")
 
   lines.push("== Fluence conservation ==")

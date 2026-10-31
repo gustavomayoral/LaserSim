@@ -44,6 +44,7 @@ function App() {
   const [memorySweep, setMemorySweep] = useState<MemorySweepStep[] | null>(null)
   const [memorySweepBusy, setMemorySweepBusy] = useState(false)
   const [cpuFallback, setCpuFallback] = useState<CpuFallbackResult | null>(null)
+  const [coarseUnsyncedMs, setCoarseUnsyncedMs] = useState<number | null>(null)
 
   const [ipcResults, setIpcResults] = useState<IpcModeResult[]>([])
   const [ipcBusyMode, setIpcBusyMode] = useState<IpcMode | null>(null)
@@ -368,6 +369,19 @@ function App() {
         const cpuFallbackResult = runCpuFallbackBenchmark(getJobs().full, SIZE_MM, fc.gridSize, fc.spotSigmaMm, fc.heatSigmaMm)
         setCpuFallback(cpuFallbackResult)
 
+        // Unsynced estimate of what real interactive scrubbing would cost
+        // (COD-252 §2 discussion): the synced numbers above are correct for
+        // the benchmark but pay a per-stage gl.finish()/readPixels cost real
+        // interactive use wouldn't need. Disposed immediately; only its
+        // timing matters here.
+        const coarseUnsynced = pipeline.run(
+          getJobs().coarse,
+          { sizeMm: SIZE_MM, gridSize: coarse.gridSize, spotSigmaMm: 0.05, heatSigmaMm: 0.03, rampScale: 600, ablationThreshold: 0.6 },
+          false,
+        )
+        coarseUnsynced.renderTarget.dispose()
+        setCoarseUnsyncedMs(coarseUnsynced.timings.totalMs)
+
         const gl = scene.renderer.getContext()
         const glErrors: string[] = []
         let glErr = gl.getError()
@@ -396,6 +410,7 @@ function App() {
           memorySweep,
           cpuFallback: cpuFallbackResult,
           ipcResults: ipcResults.length > 0 ? ipcResults : null,
+          coarseUnsyncedTotalMs: coarseUnsynced.timings.totalMs,
         })
 
         if (tauriAvailable) {
@@ -504,6 +519,13 @@ function App() {
             CPU fallback (grid {cpuFallback.gridSize}²): deposit {formatMs(cpuFallback.depositMs)}, blur H{" "}
             {formatMs(cpuFallback.blurHMs)}, blur V {formatMs(cpuFallback.blurVMs)}, total{" "}
             {formatMs(cpuFallback.totalMs)}.
+          </p>
+        )}
+        {coarseUnsyncedMs !== null && (
+          <p className="note">
+            Coarse scrub, unsynced (interactive-use estimate, not the GPU-complete number above): {formatMs(coarseUnsyncedMs)}{" "}
+            — {coarseUnsyncedMs < 50 ? "PASS" : "FAIL"} against the &lt;50ms criterion. The synced coarse-scrub total pays a
+            per-stage gl.finish()/readPixels cost real interactive use wouldn't need.
           </p>
         )}
       </section>

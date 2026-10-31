@@ -107,7 +107,13 @@ export class BurnSimPipeline {
     this.orthoCamera = new THREE.OrthographicCamera(0, 1, 1, 0, -1, 1)
   }
 
-  run(job: TestJob, config: PipelineConfig): PipelineResult {
+  // `sync = false` skips every stage's gl.finish()/readPixels sync (and its
+  // timer query), measuring only submission time — not a GPU-complete
+  // measurement, but an estimate of what real interactive use (e.g. a
+  // future live scrub control) would actually cost, since nothing there
+  // would force a synchronous block. Defaults to true (benchmark-correct)
+  // for every other caller; see gpuTimer.ts's timeStage.
+  run(job: TestJob, config: PipelineConfig, sync = true): PipelineResult {
     const renderer = this.renderer
     // renderer.setViewport() always multiplies by the renderer's pixel ratio
     // (see WebGLRenderer.js), even when a render target is bound. The
@@ -123,13 +129,13 @@ export class BurnSimPipeline {
     const previousPixelRatio = renderer.getPixelRatio()
     renderer.setPixelRatio(1)
     try {
-      return this.runAtPixelRatioOne(job, config)
+      return this.runAtPixelRatioOne(job, config, sync)
     } finally {
       renderer.setPixelRatio(previousPixelRatio)
     }
   }
 
-  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig): PipelineResult {
+  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig, sync: boolean): PipelineResult {
     const t0 = performance.now()
     const { sizeMm, gridSize, spotSigmaMm, heatSigmaMm, rampScale, ablationThreshold } = config
     const renderer = this.renderer
@@ -195,7 +201,7 @@ export class BurnSimPipeline {
       renderer.setClearColor(0x000000, 0)
       renderer.clear()
       renderer.render(depositScene, this.orthoCamera)
-    })
+    }, sync)
 
     // --- separable Gaussian blur ---
     const sigmaTotalMm = Math.sqrt(spotSigmaMm * spotSigmaMm + heatSigmaMm * heatSigmaMm)
@@ -241,7 +247,7 @@ export class BurnSimPipeline {
       renderer.setRenderTarget(blurA)
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(fullscreenSceneH, this.fullscreenCamera)
-    })
+    }, sync)
 
     const fullscreenMeshV = new THREE.Mesh(FULLSCREEN_GEOMETRY, blurMaterialV)
     const fullscreenSceneV = new THREE.Scene()
@@ -250,7 +256,7 @@ export class BurnSimPipeline {
       renderer.setRenderTarget(blurB)
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(fullscreenSceneV, this.fullscreenCamera)
-    })
+    }, sync)
 
     // --- material ramp ---
     const rampTarget = new THREE.WebGLRenderTarget(gridSize, gridSize, {
@@ -282,7 +288,7 @@ export class BurnSimPipeline {
       renderer.setRenderTarget(rampTarget)
       renderer.setViewport(0, 0, gridSize, gridSize)
       renderer.render(rampScene, this.fullscreenCamera)
-    })
+    }, sync)
     renderer.setRenderTarget(null)
     const tEnd = performance.now()
 

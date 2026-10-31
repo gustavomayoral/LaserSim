@@ -87,7 +87,25 @@ const QUERY_POLL_TIMEOUT_MS = 50
 // calls — some drivers flag a timer query's result "disjoint" if a
 // synchronizing call happens while it's still open, so ending it first keeps
 // that risk out of the measurement it's trying to take.
-export function timeStage(gl: WebGL2RenderingContext, ext: TimerExt | null, render: () => void): StageTime {
+//
+// `sync = false` skips gl.finish()/readPixels and the timer query entirely,
+// measuring only submission time (COD-251's original, naive method) — this
+// is NOT a GPU-complete measurement, but it IS what real interactive use
+// (e.g. a future live scrub control) would actually pay, since nothing
+// forces the pipeline to synchronously block there. Call sites must label
+// which one they're reporting; see report.ts.
+export function timeStage(
+  gl: WebGL2RenderingContext,
+  ext: TimerExt | null,
+  render: () => void,
+  sync = true,
+): StageTime {
+  if (!sync) {
+    const t0 = performance.now()
+    render()
+    return { wallMs: performance.now() - t0, gpuMs: null }
+  }
+
   const query = ext ? gl.createQuery() : null
   if (ext && query) gl.beginQuery(ext.TIME_ELAPSED_EXT, query)
 

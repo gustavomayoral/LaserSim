@@ -62,10 +62,22 @@ export function readGpuCapabilities(renderer: THREE.WebGLRenderer): GpuCapabilit
 }
 
 const FULLSCREEN_GEOMETRY = new THREE.PlaneGeometry(2, 2)
+// Local corners of the per-sample deposit quad (shared across all
+// instances) — see the comment on depositVertex in shaders.ts.
+const DEPOSIT_QUAD_LOCAL_POSITIONS = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1])
+const DEPOSIT_QUAD_INDICES = new Uint32Array([0, 1, 2, 2, 1, 3])
 
+// RGBAFormat, not RedFormat: additive-blending into a single-channel float
+// render target silently dropped most blended contributions on the GPU this
+// was tested on (measured ~25% of the expected deposited energy — on this
+// GPU EXT_float_blend evidently doesn't reliably cover the RED-only case,
+// even though the extension itself reports available). This is exactly the
+// platform-dependent fluence loss COD-251/COD-252 describe: it would vary
+// by GPU/driver. RGBA costs more memory for an unused G/B/A channel but
+// blends reliably; the shaders only ever read/write the R channel.
 function makeRenderTarget(size: number): THREE.WebGLRenderTarget {
   const target = new THREE.WebGLRenderTarget(size, size, {
-    format: THREE.RedFormat,
+    format: THREE.RGBAFormat,
     type: THREE.FloatType,
     minFilter: THREE.NearestFilter,
     magFilter: THREE.NearestFilter,
@@ -91,21 +103,49 @@ export class BurnSimPipeline {
   }
 
   run(job: TestJob, config: PipelineConfig): PipelineResult {
+    const renderer = this.renderer
+    // renderer.setViewport() always multiplies by the renderer's pixel ratio
+    // (see WebGLRenderer.js), even when a render target is bound. The
+    // on-screen heightmap scene sets pixel ratio to devicePixelRatio (e.g. 2
+    // on a Retina display), so every setViewport(0,0,gridSize,gridSize)
+    // call below was actually sizing the GL viewport to gridSize*ratio on
+    // each axis — up to 4x the pixel count of the gridSize^2 render target
+    // it's drawing into. That mismatch clips/misplaces most deposited
+    // samples, and is platform/device dependent (different displays report
+    // different ratios) — this is the real cause of the platform-dependent
+    // fluence loss from COD-251, not just point-rasterization ambiguity.
+    // Render the whole offscreen pipeline at ratio 1 and restore afterward.
+    const previousPixelRatio = renderer.getPixelRatio()
+    renderer.setPixelRatio(1)
+    try {
+      return this.runAtPixelRatioOne(job, config)
+    } finally {
+      renderer.setPixelRatio(previousPixelRatio)
+    }
+  }
+
+  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig): PipelineResult {
     const t0 = performance.now()
     const { sizeMm, gridSize, spotSigmaMm, heatSigmaMm, rampScale, ablationThreshold } = config
     const renderer = this.renderer
 
     // --- deposit pass ---
-    const geometry = new THREE.BufferGeometry()
-    const positions = new Float32Array(job.sampleCount * 2)
+    // One quad instance per sample, spanning exactly the 2x2 texels that
+    // sample's bilinear splat covers — see the comment on depositVertex in
+    // shaders.ts for why this replaced GL_POINTS point-sprite rendering.
+    const geometry = new THREE.InstancedBufferGeometry()
+    geometry.setIndex(new THREE.BufferAttribute(DEPOSIT_QUAD_INDICES, 1))
+    geometry.setAttribute("position", new THREE.BufferAttribute(DEPOSIT_QUAD_LOCAL_POSITIONS, 2))
+    const centers = new Float32Array(job.sampleCount * 2)
     const energies = new Float32Array(job.sampleCount)
     for (let i = 0; i < job.sampleCount; i++) {
-      positions[i * 2] = job.samples[i * 3]
-      positions[i * 2 + 1] = job.samples[i * 3 + 1]
+      centers[i * 2] = job.samples[i * 3]
+      centers[i * 2 + 1] = job.samples[i * 3 + 1]
       energies[i] = job.samples[i * 3 + 2]
     }
-    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 2))
-    geometry.setAttribute("aEnergy", new THREE.BufferAttribute(energies, 1))
+    geometry.setAttribute("aCenter", new THREE.InstancedBufferAttribute(centers, 2))
+    geometry.setAttribute("aEnergy", new THREE.InstancedBufferAttribute(energies, 1))
+    geometry.instanceCount = job.sampleCount
 
     const depositMaterial = new THREE.RawShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -115,6 +155,7 @@ export class BurnSimPipeline {
         uDomainMm: { value: new THREE.Vector2(sizeMm, sizeMm) },
         uGridSize: { value: new THREE.Vector2(gridSize, gridSize) },
       },
+      side: THREE.DoubleSide,
       depthTest: false,
       depthWrite: false,
       blending: THREE.CustomBlending,
@@ -123,15 +164,15 @@ export class BurnSimPipeline {
       blendEquation: THREE.AddEquation,
       transparent: true,
     })
-    const points = new THREE.Points(geometry, depositMaterial)
-    points.frustumCulled = false
-    // position is vec2 (mm, not a real 3D vertex), so three.js's
-    // computeBoundingSphere (which assumes itemSize 3) would read garbage and
-    // produce NaN. It's still called once per render for z-sort ordering even
-    // with frustumCulled off, so set a correct sphere directly instead.
+    const depositMesh = new THREE.Mesh(geometry, depositMaterial)
+    depositMesh.frustumCulled = false
+    // position is a local 0/1 quad corner (not a real 3D vertex), so
+    // three.js's computeBoundingSphere (which assumes itemSize 3) would read
+    // garbage and produce NaN. It's still called once per render for z-sort
+    // ordering even with frustumCulled off, so set a correct sphere directly.
     geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(sizeMm / 2, sizeMm / 2, 0), sizeMm)
     const depositScene = new THREE.Scene()
-    depositScene.add(points)
+    depositScene.add(depositMesh)
 
     this.orthoCamera.left = 0
     this.orthoCamera.right = sizeMm
@@ -236,7 +277,7 @@ export class BurnSimPipeline {
     renderer.setRenderTarget(null)
     const tRamp = performance.now()
 
-    const totalFluence = sumFluence(renderer, blurB, gridSize, pitchMm)
+    const totalFluence = sumFluenceExact(renderer, blurB, gridSize)
 
     // Dispose everything except the ramp target the caller needs to sample.
     geometry.dispose()
@@ -262,23 +303,24 @@ export class BurnSimPipeline {
   }
 }
 
-// Reads back a fixed *physical* corner region (not a fixed pixel count) of
-// the blurred fluence target and scales it up to an estimated grid total —
-// used only for the coarse/full-res "visually consistent" sanity check, not
-// the hot path. Sampling the same mm^2 window at both resolutions is what
-// makes the two numbers comparable despite very different pixel counts.
-const FLUENCE_SAMPLE_WINDOW_MM = 20
-function sumFluence(
-  renderer: THREE.WebGLRenderer,
-  target: THREE.WebGLRenderTarget,
-  gridSize: number,
-  pitchMm: number,
-): number {
-  const sampleDim = Math.min(gridSize, Math.max(1, Math.round(FLUENCE_SAMPLE_WINDOW_MM / pitchMm)))
-  const buffer = new Float32Array(sampleDim * sampleDim * 4)
-  renderer.readRenderTargetPixels(target, 0, 0, sampleDim, sampleDim, buffer)
+// Reads back the whole fluence target and sums it exactly, for the
+// fluence-conservation check (COD-252 §3). This used to read back a fixed
+// 20mm^2 corner window and scale it up to an estimated grid total, which is
+// only valid for a spatially uniform field — this job's energy is
+// concentrated near raster line ends, so a corner sample is nowhere near
+// representative of the grid average and produced a meaningless "total".
+// Reads back in row strips rather than one gridSize^2*4-float buffer, to
+// bound peak memory at full-res (a 6000^2 RGBA float buffer would be ~576MB).
+const FLUENCE_READBACK_ROWS_PER_CHUNK = 256
+function sumFluenceExact(renderer: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget, gridSize: number): number {
+  const rowsPerChunk = Math.min(gridSize, FLUENCE_READBACK_ROWS_PER_CHUNK)
+  const buffer = new Float32Array(gridSize * rowsPerChunk * 4)
   let sum = 0
-  for (let i = 0; i < sampleDim * sampleDim; i++) sum += buffer[i * 4]
-  const scale = (gridSize * gridSize) / (sampleDim * sampleDim)
-  return sum * scale
+  for (let y = 0; y < gridSize; y += rowsPerChunk) {
+    const rows = Math.min(rowsPerChunk, gridSize - y)
+    renderer.readRenderTargetPixels(target, 0, y, gridSize, rows, buffer)
+    const texelCount = gridSize * rows
+    for (let i = 0; i < texelCount; i++) sum += buffer[i * 4]
+  }
+  return sum
 }

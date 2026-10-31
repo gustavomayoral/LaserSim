@@ -299,9 +299,10 @@ function App() {
           </tbody>
         </table>
         <p className="note">
-          Total fluence (sampled 20mm² corner, scaled): full-res {fullResult?.totalFluence.toExponential(3) ?? "—"}, coarse{" "}
+          Total fluence (exact full-grid sum): full-res {fullResult?.totalFluence.toExponential(3) ?? "—"}, coarse{" "}
           {coarseResult?.totalFluence.toExponential(3) ?? "—"}
-          {fluenceRatio !== null && ` — ratio ${fluenceRatio.toFixed(3)} (1.0 = perfectly consistent)`}.
+          {fluenceRatio !== null && ` — ratio ${fluenceRatio.toFixed(3)} (1.0 = perfectly consistent)`}. See "Run benchmark" below for
+          the expected-vs-measured conservation check against each job's own sample energy.
         </p>
       </section>
 

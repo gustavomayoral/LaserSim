@@ -98,9 +98,10 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push(`  expected (coarse job):   ${expectedFluenceCoarse.toExponential(4)}`)
   lines.push(fluenceRow("full-res, post-blur", expectedFluenceFull, full?.totalFluence ?? null))
   lines.push(fluenceRow("coarse, post-blur", expectedFluenceCoarse, coarse?.totalFluence ?? null))
-  lines.push("  note: 'measured' is a 20mm^2 corner-window sample scaled to a grid-total estimate (see sumFluence()")
-  lines.push("  in pipeline.ts), not an exact full-grid readback — treat ratios as approximate until §3 lands.")
-  lines.push("  (per-stage deposit/blurH/blurV breakdown and CPU-path comparison pending COD-252 §3)")
+  lines.push("  note: 'measured' is an exact full-grid sum (sumFluenceExact() in pipeline.ts), chunked to bound")
+  lines.push("  readback memory at full-res. GPU-side per-stage (deposit/blurH/blurV) breakdown and a CPU-path")
+  lines.push("  comparison are not wired into this report yet; see src/sim/cpuReference.ts + its Vitest suite")
+  lines.push("  for the per-stage/CPU-oracle check this currently runs offline instead.")
   lines.push("")
 
   lines.push("== GPU memory and tiling ==")

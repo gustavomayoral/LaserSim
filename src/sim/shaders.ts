@@ -2,44 +2,61 @@
 // Kept as plain template strings (not three.js ShaderChunk) so the exact GLSL
 // run on the GPU is easy to read end to end for this spike.
 
+// Bilinear deposit, done as an instanced quad per sample (one quad spanning
+// exactly the 2x2 texels the sample's bilinear splat covers) instead of a
+// GL_POINTS sprite. A point sprite's on-screen coverage near the minimum
+// supported size is not reliably specified: this pipeline measured anywhere
+// from ~6% to ~400% of the expected energy depending on gl_PointSize (1, 2,
+// 4, 8) on the same GPU, with no size giving exact, size-independent
+// coverage. An ordinary quad uses standard triangle rasterization instead
+// (one well-defined fill rule, not point-sprite-specific GPU/driver
+// behavior), so each fragment's position within the quad is read directly
+// from the rasterizer-interpolated UV rather than inferred from point size,
+// and per-sample weights are guaranteed to sum to 1 (COD-251/COD-252's
+// platform-dependent fluence loss).
 export const depositVertex = /* glsl */ `
-// Named "position" (not e.g. "aPos"): three.js's non-indexed draw-count path
-// reads geometry.attributes.position.count to know how many points to draw,
-// so any other attribute name here silently draws zero vertices.
+// Local unit-quad corner, shared (not instanced) geometry: (0,0)/(1,0)/
+// (0,1)/(1,1), one set of 4 vertices reused for every instance.
 in vec2 position;
+// Per-instance (per-sample) attributes.
+in vec2 aCenter; // sample position, mm
 in float aEnergy;
 uniform mat4 projectionMatrix;
 uniform mat4 modelViewMatrix;
 uniform vec2 uDomainMm;
 uniform vec2 uGridSize;
-out float vEnergy;
+out vec2 vLocalUv;
 out vec2 vFrac;
+out float vEnergy;
 
-// Splat each sample as a bilinear point: render a 2x2-texel point sprite
-// centered exactly on the boundary between the 4 texels it contributes to,
-// then weight each covered fragment in the fragment shader below.
 void main() {
-  vec2 pixelPos = (position / uDomainMm) * uGridSize;
+  vec2 pixelPos = (aCenter / uDomainMm) * uGridSize;
   vec2 i0 = floor(pixelPos - 0.5);
   vFrac = pixelPos - (i0 + 0.5);
-  vec2 center = i0 + 1.0;
-  vec2 domainPos = (center / uGridSize) * uDomainMm;
+  // The quad spans texel i0 to i0+2 (i.e. the 2 texels this sample's
+  // bilinear splat covers on this axis); "position" (0 or 1 per axis) picks
+  // which corner of that quad this vertex is.
+  vec2 texelCorner = i0 + position * 2.0;
+  vec2 domainPos = (texelCorner / uGridSize) * uDomainMm;
   gl_Position = projectionMatrix * modelViewMatrix * vec4(domainPos, 0.0, 1.0);
-  gl_PointSize = 2.0;
+  vLocalUv = position;
   vEnergy = aEnergy;
 }
 `
 
 export const depositFragment = /* glsl */ `
 precision highp float;
-in float vEnergy;
+in vec2 vLocalUv;
 in vec2 vFrac;
+in float vEnergy;
 out vec4 fragColor;
 
 void main() {
-  vec2 pc = gl_PointCoord;
-  float wx = pc.x < 0.5 ? (1.0 - vFrac.x) : vFrac.x;
-  float wy = pc.y < 0.5 ? (1.0 - vFrac.y) : vFrac.y;
+  // vLocalUv is this fragment's rasterizer-interpolated position within the
+  // instance's quad (0..1 per axis): <0.5 is the near texel on that axis,
+  // >=0.5 is the far one, each weighted by how close aCenter was to it.
+  float wx = vLocalUv.x < 0.5 ? (1.0 - vFrac.x) : vFrac.x;
+  float wy = vLocalUv.y < 0.5 ? (1.0 - vFrac.y) : vFrac.y;
   fragColor = vec4(vEnergy * wx * wy, 0.0, 0.0, 0.0);
 }
 `
@@ -70,8 +87,20 @@ void main() {
   float sum = 0.0;
   for (int k = -${radius}; k <= ${radius}; k++) {
     float fk = float(k);
-    float w = exp(-0.5 * (fk / uSigmaTexels) * (fk / uSigmaTexels));
-    sum += texture(uTex, vUv + uTexelStep * fk).r * w;
+    vec2 sampleUv = vUv + uTexelStep * fk;
+    // Zero-pad taps that fall outside the domain instead of letting the
+    // render target's clamp-to-edge wrap mode re-read the border texel:
+    // clamping here would replay near-edge energy into multiple output
+    // texels (over-counting it, not conserving it) whenever a sample sits
+    // near the domain boundary — see pipeline.ts's deposit comment. Zero
+    // padding lets near-edge output fall below the normalized total
+    // instead, which is the physically correct direction (energy that
+    // would spread past the bed edge is lost, not reflected back in).
+    bool inBounds = sampleUv.x >= 0.0 && sampleUv.x <= 1.0 && sampleUv.y >= 0.0 && sampleUv.y <= 1.0;
+    if (inBounds) {
+      float w = exp(-0.5 * (fk / uSigmaTexels) * (fk / uSigmaTexels));
+      sum += texture(uTex, sampleUv).r * w;
+    }
   }
   fragColor = vec4(sum * uInvNorm, 0.0, 0.0, 0.0);
 }

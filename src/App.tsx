@@ -3,6 +3,7 @@ import { isTauri } from "@tauri-apps/api/core"
 import { buildTestJob, defaultJobParams, type TestJob } from "./sim/testJob"
 import { BurnSimPipeline, readGpuCapabilities, stageTimes, type GpuCapabilities } from "./sim/pipeline"
 import { resolveGpuTimes } from "./sim/gpuTimer"
+import { runCpuReference } from "./sim/cpuReference"
 import { HeightmapScene } from "./render/HeightmapScene"
 import { buildReportText, type RunSummary, type TimingSeries } from "./bench/report"
 import { runMemoryTilingSweep, type MemorySweepStep } from "./bench/memorySweep"
@@ -379,7 +380,9 @@ function App() {
 
   // Runs one pass synchronously and returns its summary; callers decide when
   // to let the UI paint "busy" first. Throws on pipeline error.
-  function executePass(kind: "full" | "coarse"): RunResult {
+  // `measureStages` adds the per-stage fluence readbacks the benchmark
+  // report's conservation table needs (outside the timed section).
+  function executePass(kind: "full" | "coarse", measureStages = false): RunResult {
     const pipeline = pipelineRef.current
     const scene = sceneRef.current
     if (!pipeline || !scene) throw new Error("pipeline not initialized")
@@ -398,9 +401,14 @@ function App() {
       // Not a physical calibration — see "Out of scope" in COD-251.
       rampScale: 600,
       ablationThreshold: 0.6,
-    })
+    }, true, { measureStages })
     scene.setTexture(result.renderTarget, result.gridSize)
-    return { gridSize: result.gridSize, timings: result.timings, totalFluence: result.totalFluence }
+    return {
+      gridSize: result.gridSize,
+      timings: result.timings,
+      totalFluence: result.totalFluence,
+      stageFluence: result.stageFluence,
+    }
   }
 
   function runPass(kind: "full" | "coarse") {
@@ -451,10 +459,10 @@ function App() {
     requestAnimationFrame(async () => {
       try {
         log("Running full-res pass...")
-        const full = executePass("full")
+        const full = executePass("full", true)
         log(`Full-res done: total ${full.timings.totalMs.toFixed(1)} ms`)
         log("Running coarse-scrub pass...")
-        const coarse = executePass("coarse")
+        const coarse = executePass("coarse", true)
         log(`Coarse-scrub done: total ${coarse.timings.totalMs.toFixed(1)} ms`)
         setFullResult(full)
         setCoarseResult(coarse)
@@ -493,6 +501,17 @@ function App() {
         const cpuFallbackResult = runCpuFallbackBenchmark(getJobs().full, SIZE_MM, fc.gridSize, fc.spotSigmaMm, fc.heatSigmaMm)
         setCpuFallback(cpuFallbackResult)
         log(`CPU fallback done: total ${cpuFallbackResult.totalMs.toFixed(1)} ms`)
+
+        // CPU oracle for the coarse job's per-stage fluence row (the
+        // full-res row reuses the CPU-fallback run above). 500^2 with a
+        // radius-1 kernel, so this is cheap.
+        log("Running CPU reference on the coarse job (per-stage fluence)...")
+        const coarseCpuFluence = runCpuReference(
+          getJobs().coarse,
+          SIZE_MM,
+          coarse.gridSize,
+          Math.sqrt(fc.spotSigmaMm * fc.spotSigmaMm + fc.heatSigmaMm * fc.heatSigmaMm),
+        )
 
         // Unsynced estimate of what real interactive scrubbing would cost
         // (COD-252 §2 discussion): the synced numbers above are correct for
@@ -535,6 +554,7 @@ function App() {
           coarseSeries,
           memorySweep,
           cpuFallback: cpuFallbackResult,
+          coarseCpuFluence,
           ipcResults: ipcResults.length > 0 ? ipcResults : null,
           coarseUnsyncedTotalMs: coarseUnsynced.timings.totalMs,
         })

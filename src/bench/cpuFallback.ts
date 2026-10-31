@@ -2,7 +2,7 @@
 // the full-res test job, always — not only on GPUs missing EXT_float_blend —
 // so the fallback's cost is a known number rather than an assumption.
 
-import { runCpuReferenceTimed } from "../sim/cpuReference"
+import { runCpuReferenceTimed, type CpuReferenceResult } from "../sim/cpuReference"
 import type { TestJob } from "../sim/testJob"
 
 export interface CpuFallbackResult {
@@ -11,6 +11,9 @@ export interface CpuFallbackResult {
   blurHMs: number
   blurVMs: number
   totalMs: number
+  // Per-stage sums from the same run, reused as the CPU column of the
+  // full-res fluence-conservation table so the 10s CPU pass isn't run twice.
+  stageFluence: CpuReferenceResult
 }
 
 export function runCpuFallbackBenchmark(
@@ -28,5 +31,6 @@ export function runCpuFallbackBenchmark(
     blurHMs: timed.blurHMs,
     blurVMs: timed.blurVMs,
     totalMs: timed.totalMs,
+    stageFluence: timed.result,
   }
 }

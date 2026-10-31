@@ -1,4 +1,5 @@
-import type { GpuCapabilities, PassTimings } from "../sim/pipeline"
+import type { GpuCapabilities, PassTimings, StageFluence } from "../sim/pipeline"
+import type { CpuReferenceResult } from "../sim/cpuReference"
 import { minMaxMedian } from "../sim/gpuTimer"
 import type { MemorySweepStep } from "./memorySweep"
 import type { CpuFallbackResult } from "./cpuFallback"
@@ -8,6 +9,7 @@ export interface RunSummary {
   gridSize: number
   timings: PassTimings
   totalFluence: number
+  stageFluence?: StageFluence // present when the pass ran with measureStages
 }
 
 export interface TimingSeries {
@@ -26,6 +28,9 @@ export interface BenchmarkInputs {
   coarseSeries: TimingSeries | null
   memorySweep: MemorySweepStep[] | null
   cpuFallback: CpuFallbackResult | null
+  // CPU per-stage sums for the coarse job (the full-res ones come from
+  // cpuFallback.stageFluence).
+  coarseCpuFluence: CpuReferenceResult | null
   ipcResults: IpcModeResult[] | null
   // Unsynced (submission-time-only) coarse-scrub total, as an estimate of
   // what real interactive use would cost — NOT comparable to the synced
@@ -53,13 +58,41 @@ function fmtStage(label: string, wallMs: number, gpuMs: number | null): string {
   return `  ${label}: wall=${fmtMs(wallMs)} ${gpuPart}`
 }
 
-function fluenceRow(label: string, expected: number, measured: number | null): string {
-  if (measured === null) return `  ${label}: not instrumented yet (pending COD-252 §3 CPU reference implementation)`
+const FLUENCE_STAGES = [
+  ["after deposit", "afterDeposit"],
+  ["after blur H ", "afterBlurH"],
+  ["after blur V ", "afterBlurV"],
+] as const
+
+function fluenceCell(expected: number, measured: number | undefined): { text: string; pass: boolean | null } {
+  if (measured === undefined) return { text: "not measured".padEnd(26), pass: null }
   const ratio = expected !== 0 ? measured / expected : NaN
-  const withinOnePercent = Number.isFinite(ratio) && Math.abs(ratio - 1) <= 0.01
-  return `  ${label}: expected=${expected.toExponential(4)} measured=${measured.toExponential(4)} ratio=${ratio.toFixed(4)} ${
-    withinOnePercent ? "PASS" : "FAIL"
-  }`
+  const pass = Number.isFinite(ratio) && Math.abs(ratio - 1) <= 0.01
+  return { text: `${measured.toExponential(4)} (${ratio.toFixed(4)}) ${pass ? "PASS" : "FAIL"}`.padEnd(26), pass }
+}
+
+// One grid's per-stage table (COD-252 §3): GPU and CPU sums after each stage
+// against the job's own deposited energy, PASS within 1%, plus how far the
+// GPU sum is from the CPU oracle at that stage.
+function fluenceTable(
+  label: string,
+  expected: number,
+  gpu: StageFluence | undefined,
+  cpu: CpuReferenceResult | null,
+): string[] {
+  const lines = [`  ${label} (expected ${expected.toExponential(4)}):`]
+  lines.push(`    ${"stage".padEnd(13)}  ${"GPU sum (ratio)".padEnd(26)}  ${"CPU sum (ratio)".padEnd(26)}  GPU vs CPU`)
+  for (const [name, key] of FLUENCE_STAGES) {
+    const g = fluenceCell(expected, gpu?.[key])
+    const c = fluenceCell(expected, cpu?.[key])
+    const gpuValue = gpu?.[key]
+    const cpuValue = cpu?.[key]
+    const diffPct = gpuValue !== undefined && cpuValue !== undefined && cpuValue !== 0 ? ((gpuValue - cpuValue) / cpuValue) * 100 : null
+    // Rounds float noise to a plain 0.000% rather than "-0.000%".
+    const diff = diffPct === null ? "n/a" : `${(Math.abs(diffPct) < 0.0005 ? 0 : diffPct).toFixed(3)}%`
+    lines.push(`    ${name}  ${g.text}  ${c.text}  ${diff}`)
+  }
+  return lines
 }
 
 function runSection(label: string, run: RunSummary | null): string {
@@ -138,6 +171,7 @@ export function buildReportText(inputs: BenchmarkInputs): string {
     coarseSeries,
     memorySweep,
     cpuFallback,
+    coarseCpuFluence,
     ipcResults,
     coarseUnsyncedTotalMs,
   } = inputs
@@ -205,12 +239,11 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push("same path at different pitches, so each has its own discretized expectation)")
   lines.push(`  expected (full-res job): ${expectedFluenceFull.toExponential(4)}`)
   lines.push(`  expected (coarse job):   ${expectedFluenceCoarse.toExponential(4)}`)
-  lines.push(fluenceRow("full-res, post-blur", expectedFluenceFull, full?.totalFluence ?? null))
-  lines.push(fluenceRow("coarse, post-blur", expectedFluenceCoarse, coarse?.totalFluence ?? null))
-  lines.push("  note: 'measured' is an exact full-grid sum (sumFluenceExact() in pipeline.ts), chunked to bound")
-  lines.push("  readback memory at full-res. GPU-side per-stage (deposit/blurH/blurV) breakdown and a CPU-path")
-  lines.push("  comparison are not wired into this report yet; see src/sim/cpuReference.ts + its Vitest suite")
-  lines.push("  for the per-stage/CPU-oracle check this currently runs offline instead.")
+  lines.push("each cell: exact full-grid sum (ratio to expected) PASS/FAIL at 1%. GPU sums read back each stage's")
+  lines.push("render target (sumFluenceExact() in pipeline.ts); CPU sums come from src/sim/cpuReference.ts, the")
+  lines.push("same deposit + separable blur math run on the CPU (the full-res CPU run is the CPU-fallback pass below).")
+  lines.push(...fluenceTable("full-res", expectedFluenceFull, full?.stageFluence, cpuFallback?.stageFluence ?? null))
+  lines.push(...fluenceTable("coarse", expectedFluenceCoarse, coarse?.stageFluence, coarseCpuFluence))
   lines.push("")
 
   lines.push("== GPU memory and tiling ==")

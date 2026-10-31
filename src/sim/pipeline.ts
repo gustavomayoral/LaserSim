@@ -43,6 +43,17 @@ export interface PipelineResult {
   totalFluence: number // sum over the grid, for the coarse/full-res consistency check
   // Only present when run() is called with { diagnose: true }.
   diagnostics?: StageDiagnostics[]
+  // Only present when run() is called with { measureStages: true }.
+  stageFluence?: StageFluence
+}
+
+// Exact grid-wide fluence sum after each stage, for the per-stage
+// conservation table (COD-252 §3). Same shape as cpuReference.ts's
+// CpuReferenceResult, so GPU and CPU rows line up.
+export interface StageFluence {
+  afterDeposit: number
+  afterBlurH: number
+  afterBlurV: number
 }
 
 // Per-stage health check for runs where "no exception and no context loss"
@@ -173,7 +184,17 @@ export class BurnSimPipeline {
   // errors raised during it (see StageDiagnostics). Off by default: it adds
   // a checkFramebufferStatus + getError round-trip per stage, which can
   // stall the pipeline on some drivers and would skew the timed runs.
-  run(job: TestJob, config: PipelineConfig, sync = true, { diagnose = false } = {}): PipelineResult {
+  //
+  // `measureStages = true` also sums the deposit and blur-H targets (the
+  // blur-V sum is totalFluence, always computed). These are two more
+  // full-grid readbacks — done after the timed section, so timings are
+  // unaffected, but they add real time at full-res.
+  run(
+    job: TestJob,
+    config: PipelineConfig,
+    sync = true,
+    { diagnose = false, measureStages = false } = {},
+  ): PipelineResult {
     const renderer = this.renderer
     // renderer.setViewport() always multiplies by the renderer's pixel ratio
     // (see WebGLRenderer.js), even when a render target is bound. The
@@ -189,13 +210,19 @@ export class BurnSimPipeline {
     const previousPixelRatio = renderer.getPixelRatio()
     renderer.setPixelRatio(1)
     try {
-      return this.runAtPixelRatioOne(job, config, sync, diagnose)
+      return this.runAtPixelRatioOne(job, config, sync, diagnose, measureStages)
     } finally {
       renderer.setPixelRatio(previousPixelRatio)
     }
   }
 
-  private runAtPixelRatioOne(job: TestJob, config: PipelineConfig, sync: boolean, diagnose: boolean): PipelineResult {
+  private runAtPixelRatioOne(
+    job: TestJob,
+    config: PipelineConfig,
+    sync: boolean,
+    diagnose: boolean,
+    measureStages: boolean,
+  ): PipelineResult {
     const t0 = performance.now()
     const { sizeMm, gridSize, spotSigmaMm, heatSigmaMm, rampScale, ablationThreshold } = config
     const renderer = this.renderer
@@ -367,6 +394,13 @@ export class BurnSimPipeline {
 
     const totalFluence = sumFluenceExact(renderer, blurB, gridSize)
     checkStage("readback")
+    const stageFluence: StageFluence | undefined = measureStages
+      ? {
+          afterDeposit: sumFluenceExact(renderer, depositTarget, gridSize),
+          afterBlurH: sumFluenceExact(renderer, blurA, gridSize),
+          afterBlurV: totalFluence,
+        }
+      : undefined
 
     // Dispose everything except the ramp target the caller needs to sample.
     geometry.dispose()
@@ -383,6 +417,7 @@ export class BurnSimPipeline {
       gridSize,
       totalFluence,
       diagnostics,
+      stageFluence,
       timings: {
         deposit: depositTiming,
         blurH: blurHTiming,

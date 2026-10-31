@@ -2,9 +2,32 @@
 mod gcode_listener;
 mod ipc_bench;
 
+use std::io::Write;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+// Mirrors the frontend's in-app status log to a plain-text file at the
+// project root (one level up from src-tauri, where this crate's manifest
+// lives — resolved at compile time so it doesn't depend on the process's
+// working directory), so it can be read without the app's own window
+// (remote debugging, or just tailing it from a terminal). Truncated once
+// at startup (see run()) so each launch starts a fresh file instead of an
+// ever-growing one across relaunches.
+fn session_log_path() -> std::path::PathBuf {
+    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).join("lasersim-session.log")
+}
+
+#[tauri::command]
+fn append_session_log(line: String) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(session_log_path())
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{line}").map_err(|e| e.to_string())
 }
 
 // Default filename offered by the frontend's save dialog (App.tsx), kept
@@ -38,11 +61,13 @@ pub fn run() {
             greet,
             default_benchmark_report_name,
             write_benchmark_report,
+            append_session_log,
             ipc_bench::start_gcode_batched,
             ipc_bench::start_gcode_channel,
             ipc_bench::ping
         ])
         .setup(|app| {
+            let _ = std::fs::write(session_log_path(), "");
             gcode_listener::spawn(app.handle().clone(), gcode_listener::DEFAULT_PORT);
             Ok(())
         })

@@ -38,6 +38,15 @@ function App() {
       const next = [...prev, line]
       return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next
     })
+    // Mirrored to lasersim-session.log at the project root (src-tauri/lib.rs's
+    // append_session_log), so the log is readable without the app's own
+    // window — e.g. over SSH while debugging a remote machine. Fire-and-
+    // forget: logging must never block or fail the action it's reporting on.
+    if (tauriAvailable) {
+      import("@tauri-apps/api/core")
+        .then(({ invoke }) => invoke("append_session_log", { line }))
+        .catch(() => {})
+    }
   }
 
   useEffect(() => {

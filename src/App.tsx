@@ -461,6 +461,14 @@ function App() {
         log("Running full-res pass...")
         const full = executePass("full", true)
         log(`Full-res done: total ${full.timings.totalMs.toFixed(1)} ms`)
+        // Measured here, while the full-res result is the texture on screen
+        // (the coarse pass below replaces it).
+        log("Measuring heightmap fps (5 s camera orbit on the full-res result)...")
+        const heightmapFps = await scene.measureFps(5000)
+        log(
+          `Heightmap: ${heightmapFps.meanFps.toFixed(1)} fps mean, frame p50/p95 ${heightmapFps.frameMsP50.toFixed(1)}/${heightmapFps.frameMsP95.toFixed(1)} ms` +
+            (heightmapFps.pageHiddenDuringRun ? " (window was hidden — not valid)" : ""),
+        )
         log("Running coarse-scrub pass...")
         const coarse = executePass("coarse", true)
         log(`Coarse-scrub done: total ${coarse.timings.totalMs.toFixed(1)} ms`)
@@ -571,6 +579,7 @@ function App() {
           coarseCpuFluence,
           ipcResults: ipcResults.length > 0 ? ipcResults : null,
           coarseUnsyncedTotalMs: coarseUnsynced.timings.totalMs,
+          heightmapFps,
         })
 
         lastReportRef.current = report

@@ -1,5 +1,6 @@
 import type { GpuCapabilities, PassTimings, StageFluence } from "../sim/pipeline"
 import type { CpuReferenceResult } from "../sim/cpuReference"
+import type { FpsResult } from "../render/HeightmapScene"
 import { minMaxMedian } from "../sim/gpuTimer"
 import type { MemorySweepStep } from "./memorySweep"
 import type { CpuFallbackResult } from "./cpuFallback"
@@ -47,6 +48,7 @@ export interface BenchmarkInputs {
   // what real interactive use would cost — NOT comparable to the synced
   // numbers above. See pipeline.ts's run() `sync` param.
   coarseUnsyncedTotalMs: number | null
+  heightmapFps: FpsResult | null
 }
 
 // Coarse platform label for the report filename/header. No OS plugin is wired
@@ -197,6 +199,7 @@ export function buildReportText(inputs: BenchmarkInputs): string {
     coarseCpuFluence,
     ipcResults,
     coarseUnsyncedTotalMs,
+    heightmapFps,
   } = inputs
   const now = new Date()
 
@@ -260,6 +263,26 @@ export function buildReportText(inputs: BenchmarkInputs): string {
     lines.push("  correctness, so this is the number closer to what that would actually feel like.")
   } else {
     lines.push("Coarse scrub, UNSYNCED (interactive-use estimate): not measured this run")
+  }
+  lines.push("")
+
+  lines.push("== Heightmap fps ==")
+  if (!heightmapFps) {
+    lines.push("  not measured this run")
+  } else {
+    const f = heightmapFps
+    lines.push("  method: camera orbits one full turn over the run; each rAF-to-rAF interval is one frame time.")
+    lines.push("  rAF is capped by the display refresh rate, so ~60 fps on a 60Hz panel is the ceiling, not a limit")
+    lines.push("  of the GPU; a GPU-bound frame shows as a longer interval.")
+    lines.push(`  texture: ${f.textureGridSize !== null ? `${f.textureGridSize}x${f.textureGridSize} result` : "placeholder (no result yet)"}`)
+    lines.push(`  canvas: ${f.canvasPx.width}x${f.canvasPx.height} device px (fps scales with this; note the window size)`)
+    lines.push(`  ${f.frames} frames over ${fmtMs(f.durationMs)}: mean ${f.meanFps.toFixed(1)} fps`)
+    lines.push(`  frame time p50/p95/max: ${fmtMs(f.frameMsP50)} / ${fmtMs(f.frameMsP95)} / ${fmtMs(f.frameMsMax)}`)
+    lines.push(`  long frames (> 25 ms): ${f.longFrames}`)
+    if (f.pageHiddenDuringRun) {
+      lines.push("  WARNING: the page was hidden during the run (window minimized or covered), which throttles")
+      lines.push("  rAF — these numbers are NOT valid. Re-run with the app window visible.")
+    }
   }
   lines.push("")
 

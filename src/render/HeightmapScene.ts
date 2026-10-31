@@ -2,6 +2,40 @@ import * as THREE from "three"
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js"
 import { heightmapVertex, heightmapFragment } from "../sim/shaders"
 
+// Result of measureFps(). Frame times are rAF-to-rAF intervals, so they're
+// capped below by the display's refresh interval (16.7ms at 60Hz) — a
+// GPU-bound frame shows up as a longer interval, not a higher fps.
+export interface FpsResult {
+  durationMs: number
+  frames: number
+  meanFps: number
+  frameMsP50: number
+  frameMsP95: number
+  frameMsMax: number
+  // Intervals over 1.5x the 60Hz budget (25ms), i.e. visibly dropped frames.
+  longFrames: number
+  textureGridSize: number | null
+  // Drawing-buffer size in device pixels: fps scales with it, so a result
+  // from the default 800x600 window isn't comparable to a maximized one.
+  canvasPx: { width: number; height: number }
+  // rAF is throttled or paused while the page is hidden or the window is
+  // occluded/minimized, which makes the numbers meaningless; flagged rather
+  // than silently reported.
+  pageHiddenDuringRun: boolean
+}
+
+interface FpsProbe {
+  startMs: number
+  durationMs: number
+  lastMs: number | null
+  intervals: number[]
+  hidden: boolean
+  radius: number
+  height: number
+  startAngle: number
+  resolve: (result: FpsResult) => void
+}
+
 // Owns the three.js scene/camera/controls for the heightmap preview. Kept as
 // a plain class (not a React hook) so App.tsx can create one on mount and
 // just hand it fresh pipeline output each run.
@@ -16,6 +50,8 @@ export class HeightmapScene {
   private ownedTarget: THREE.WebGLRenderTarget | null = null
   private placeholderTex: THREE.DataTexture
   private displaySize = new THREE.Vector2(1, 1)
+  private fpsProbe: FpsProbe | null = null
+  private textureGridSize: number | null = null
 
   constructor(canvas: HTMLCanvasElement, sizeMm: number) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
@@ -57,7 +93,8 @@ export class HeightmapScene {
     this.mesh.rotation.x = -Math.PI / 2
     this.scene.add(this.mesh)
 
-    const loop = () => {
+    const loop = (now: number) => {
+      this.stepFpsProbe(now)
       this.controls.update()
       try {
         // BurnSimPipeline renders its offscreen passes on this same shared
@@ -85,6 +122,69 @@ export class HeightmapScene {
     this.material.uniforms.uTexelStep.value = new THREE.Vector2(1 / gridSize, 1 / gridSize)
     this.ownedTarget?.dispose()
     this.ownedTarget = target
+    this.textureGridSize = gridSize
+  }
+
+  // Heightmap fps check (COD-252 pass criterion "heightmap ~60 fps"):
+  // orbits the camera one full turn around the target over `durationMs`,
+  // driven from the render loop itself so every frame both moves and
+  // renders, and records each rAF-to-rAF interval. The camera is put back
+  // where it was afterwards. User drags during the run are overridden.
+  measureFps(durationMs = 5000): Promise<FpsResult> {
+    if (this.fpsProbe) return Promise.reject(new Error("fps measurement already running"))
+    const offset = this.camera.position.clone().sub(this.controls.target)
+    const savedPosition = this.camera.position.clone()
+    return new Promise<FpsResult>((resolve) => {
+      this.fpsProbe = {
+        startMs: performance.now(),
+        durationMs,
+        lastMs: null,
+        intervals: [],
+        hidden: document.hidden,
+        radius: Math.hypot(offset.x, offset.z),
+        height: offset.y,
+        startAngle: Math.atan2(offset.z, offset.x),
+        resolve: (result) => {
+          this.camera.position.copy(savedPosition)
+          resolve(result)
+        },
+      }
+    })
+  }
+
+  private stepFpsProbe(now: number) {
+    const probe = this.fpsProbe
+    if (!probe) return
+    probe.hidden ||= document.hidden
+    if (probe.lastMs !== null) probe.intervals.push(now - probe.lastMs)
+    probe.lastMs = now
+
+    const elapsed = now - probe.startMs
+    const angle = probe.startAngle + (2 * Math.PI * Math.min(elapsed, probe.durationMs)) / probe.durationMs
+    const target = this.controls.target
+    this.camera.position.set(
+      target.x + probe.radius * Math.cos(angle),
+      target.y + probe.height,
+      target.z + probe.radius * Math.sin(angle),
+    )
+
+    if (elapsed < probe.durationMs) return
+    this.fpsProbe = null
+    const sorted = [...probe.intervals].sort((a, b) => a - b)
+    const pick = (p: number) => (sorted.length > 0 ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : NaN)
+    const total = probe.intervals.reduce((sum, ms) => sum + ms, 0)
+    probe.resolve({
+      durationMs: elapsed,
+      frames: probe.intervals.length,
+      meanFps: total > 0 ? (probe.intervals.length / total) * 1000 : 0,
+      frameMsP50: pick(0.5),
+      frameMsP95: pick(0.95),
+      frameMsMax: sorted.length > 0 ? sorted[sorted.length - 1] : NaN,
+      longFrames: probe.intervals.filter((ms) => ms > 25).length,
+      textureGridSize: this.textureGridSize,
+      canvasPx: { width: this.renderer.domElement.width, height: this.renderer.domElement.height },
+      pageHiddenDuringRun: probe.hidden,
+    })
   }
 
   resize(width: number, height: number) {

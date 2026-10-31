@@ -27,6 +27,7 @@ function App() {
   const jobsRef = useRef<{ full: TestJob; coarse: TestJob } | null>(null)
 
   const [caps, setCaps] = useState<GpuCapabilities | null>(null)
+  const [initError, setInitError] = useState<string | null>(null)
   const [fullResult, setFullResult] = useState<RunResult | null>(null)
   const [coarseResult, setCoarseResult] = useState<RunResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -58,23 +59,34 @@ function App() {
 
   useEffect(() => {
     if (!canvasRef.current) return
-    const scene = new HeightmapScene(canvasRef.current, SIZE_MM)
-    sceneRef.current = scene
-    const pipeline = new BurnSimPipeline(scene.renderer)
-    pipelineRef.current = pipeline
-    pipeline.warmup()
-    setCaps(readGpuCapabilities(scene.renderer))
+    // Uncaught here would crash the whole mount (React unmounts to a blank
+    // page on an error thrown from an effect, with nothing in the UI to say
+    // why) — this runs scene/context creation and a full warmup pass on a
+    // GPU/driver combination that may behave differently than the one this
+    // was developed against, so failure here must be visible, not fatal.
+    let scene: HeightmapScene | null = null
+    try {
+      scene = new HeightmapScene(canvasRef.current, SIZE_MM)
+      sceneRef.current = scene
+      const pipeline = new BurnSimPipeline(scene.renderer)
+      pipelineRef.current = pipeline
+      setCaps(readGpuCapabilities(scene.renderer))
+      pipeline.warmup()
+    } catch (err) {
+      setInitError(`Startup failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!scene) return
 
     const resize = () => {
       const el = canvasRef.current
       if (!el) return
-      scene.resize(el.clientWidth, el.clientHeight)
+      scene!.resize(el.clientWidth, el.clientHeight)
     }
     resize()
     window.addEventListener("resize", resize)
     return () => {
       window.removeEventListener("resize", resize)
-      scene.dispose()
+      scene!.dispose()
     }
   }, [])
 
@@ -443,6 +455,12 @@ function App() {
         Tauri + WebGL2 burn-sim performance test: deposit (bilinear points, additive) → separable Gaussian blur →
         material ramp → three.js heightmap.
       </p>
+
+      {initError && (
+        <section className="panel">
+          <p className="error">{initError}</p>
+        </section>
+      )}
 
       <section className="panel">
         <h2>GPU capabilities</h2>

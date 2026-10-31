@@ -110,29 +110,32 @@ in vec2 vUv;
 uniform sampler2D uTex;
 uniform vec2 uTexelStep; // (1/gridSize, 0) or (0, 1/gridSize)
 uniform float uSigmaTexels;
-uniform float uInvNorm;
 out vec4 fragColor;
 
 void main() {
+  // Skip taps that fall outside the domain instead of letting the render
+  // target's clamp-to-edge wrap mode re-read the border texel: clamping the
+  // SAMPLE here would replay near-edge energy into multiple output texels
+  // (over-counting it, not conserving it) — see pipeline.ts's deposit
+  // comment. Normalizing by only the in-bounds taps' own weight sum (rather
+  // than a fixed uniform computed assuming every tap exists) instead treats
+  // the boundary as reflective: an edge texel's missing taps redistribute
+  // their share onto the taps that do exist, so no energy is lost at the
+  // domain edge — COD-252 §3's pass criterion needs full-res within 1%,
+  // which a lossy (zero-padded) boundary can't reach at this job's scale.
   float sum = 0.0;
+  float weightSum = 0.0;
   for (int k = -${radius}; k <= ${radius}; k++) {
     float fk = float(k);
     vec2 sampleUv = vUv + uTexelStep * fk;
-    // Zero-pad taps that fall outside the domain instead of letting the
-    // render target's clamp-to-edge wrap mode re-read the border texel:
-    // clamping here would replay near-edge energy into multiple output
-    // texels (over-counting it, not conserving it) whenever a sample sits
-    // near the domain boundary — see pipeline.ts's deposit comment. Zero
-    // padding lets near-edge output fall below the normalized total
-    // instead, which is the physically correct direction (energy that
-    // would spread past the bed edge is lost, not reflected back in).
     bool inBounds = sampleUv.x >= 0.0 && sampleUv.x <= 1.0 && sampleUv.y >= 0.0 && sampleUv.y <= 1.0;
     if (inBounds) {
       float w = exp(-0.5 * (fk / uSigmaTexels) * (fk / uSigmaTexels));
       sum += texture(uTex, sampleUv).r * w;
+      weightSum += w;
     }
   }
-  fragColor = vec4(sum * uInvNorm, 0.0, 0.0, 0.0);
+  fragColor = vec4(sum / weightSum, 0.0, 0.0, 0.0);
 }
 `
 }

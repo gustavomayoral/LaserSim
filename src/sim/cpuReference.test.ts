@@ -58,23 +58,28 @@ describe("cpuBlurPass", () => {
 describe("runCpuReference", () => {
   // Raster lines run edge-to-edge (x=0 to x=sizeMm, same for y), and
   // velocity ramps down to a floor right at each edge (testJob.ts), so a
-  // real — not platform-dependent — amount of energy sits within one blur
-  // radius of the domain boundary and is genuinely lost once blur zero-pads
-  // taps that fall outside the grid rather than reflecting them back in
-  // (see the boundary-handling comment on cpuBlurPass / the GPU blur
-  // fragment shader). That near-edge mass is roughly job-size-independent
-  // while the job's total energy grows with sizeMm, so this is a sizeMm=25
-  // job deliberately small enough to make that structural effect dominate
-  // and land outside 1% — it's here to document the effect exists, not to
-  // assert a pass criterion against it.
-  it("shows the known small-domain edge-loss effect at this scale (not a 1% pass criterion)", () => {
+  // real amount of energy sits within one blur radius of the domain
+  // boundary on every job regardless of size. Blur's boundary is reflective
+  // (cpuBlurPass/the GPU blur fragment shader normalize each output texel by
+  // only its in-bounds taps' weight sum, not a fixed global one), which
+  // conserves exactly for an interior source (same math as the single-
+  // impulse test above) but not quite exactly for a source near the
+  // boundary: that source feeds several nearby outputs, each normalized by
+  // its OWN (smaller, boundary-reduced) weight sum, so its total outgoing
+  // weight across all of them isn't guaranteed to be exactly 1 the way an
+  // interior source's is. In practice this is a small residual, not the
+  // zero-pad policy's outright loss — this sizeMm=25 job is small enough
+  // that the near-boundary fraction of its total energy is large, so the
+  // residual is visible here (~3%) even though it's negligible at
+  // production scale (see the <1% checks below, which are the actual
+  // COD-252 §3 pass criterion).
+  it("conserves fluence much more closely than the old lossy zero-pad boundary, even for a small edge-dominated job", () => {
     const job = buildTestJob(smallJobParams)
     const expected = expectedEnergy(job.samples)
     const result = runCpuReference(job, smallJobParams.sizeMm, GRID_SIZE, SIGMA_TOTAL_MM)
 
     expect(result.afterDeposit / expected).toBeCloseTo(1, 2)
-    expect(result.afterBlurV / expected).toBeGreaterThan(0.85)
-    expect(result.afterBlurV / expected).toBeLessThan(1)
+    expect(Math.abs(result.afterBlurV / expected - 1)).toBeLessThan(0.05)
   })
 
   // At the production job's actual size (defaultJobParams: 100mm, raster

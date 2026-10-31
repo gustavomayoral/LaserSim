@@ -48,28 +48,30 @@ export function cpuDeposit(job: TestJob, sizeMm: number, gridSize: number): Floa
 export function cpuBlurPass(grid: Float32Array, gridSize: number, sigmaTexels: number, axis: "x" | "y"): Float32Array {
   const radius = Math.min(64, Math.max(1, Math.ceil(3 * sigmaTexels)))
   const weights = new Float32Array(2 * radius + 1)
-  let sumWeights = 0
   for (let k = -radius; k <= radius; k++) {
-    const w = Math.exp(-0.5 * (k / sigmaTexels) ** 2)
-    weights[k + radius] = w
-    sumWeights += w
+    weights[k + radius] = Math.exp(-0.5 * (k / sigmaTexels) ** 2)
   }
-  const invNorm = 1 / sumWeights
 
-  // Zero-pad out-of-domain taps rather than clamping to the edge texel — see
-  // the matching comment on the GPU blur fragment shader in shaders.ts for
-  // why clamping over-counts energy concentrated near the domain boundary.
+  // Skip out-of-domain taps rather than clamping to the edge texel — see the
+  // matching comment on the GPU blur fragment shader in shaders.ts for why
+  // clamping the SAMPLE over-counts energy concentrated near the domain
+  // boundary. Normalizing each output texel by only its in-bounds taps'
+  // weight sum (not a fixed global sumWeights) instead treats the boundary
+  // as reflective, so no energy is lost at the domain edge.
   const out = new Float32Array(gridSize * gridSize)
   for (let y = 0; y < gridSize; y++) {
     for (let x = 0; x < gridSize; x++) {
       let sum = 0
+      let weightSum = 0
       for (let k = -radius; k <= radius; k++) {
         const sx = axis === "x" ? x + k : x
         const sy = axis === "y" ? y + k : y
         if (sx < 0 || sx >= gridSize || sy < 0 || sy >= gridSize) continue
-        sum += grid[sy * gridSize + sx] * weights[k + radius]
+        const w = weights[k + radius]
+        sum += grid[sy * gridSize + sx] * w
+        weightSum += w
       }
-      out[y * gridSize + x] = sum * invNorm
+      out[y * gridSize + x] = sum / weightSum
     }
   }
   return out

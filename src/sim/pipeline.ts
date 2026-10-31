@@ -202,9 +202,6 @@ export class BurnSimPipeline {
     const pitchMm = sizeMm / gridSize
     const sigmaTexels = Math.max(sigmaTotalMm / pitchMm, 1e-3)
     const radius = Math.min(64, Math.max(1, Math.ceil(3 * sigmaTexels)))
-    let sumWeights = 0
-    for (let k = -radius; k <= radius; k++) sumWeights += Math.exp(-0.5 * (k / sigmaTexels) ** 2)
-    const invNorm = 1 / sumWeights
 
     const blurA = makeRenderTarget(gridSize)
     const blurB = makeRenderTarget(gridSize)
@@ -219,7 +216,6 @@ export class BurnSimPipeline {
         uTex: { value: depositTarget.texture },
         uTexelStep: { value: new THREE.Vector2(1 / gridSize, 0) },
         uSigmaTexels: { value: sigmaTexels },
-        uInvNorm: { value: invNorm },
       },
     })
     // Built fresh rather than via blurMaterialH.clone(): RawShaderMaterial's
@@ -235,7 +231,6 @@ export class BurnSimPipeline {
         uTex: { value: blurA.texture },
         uTexelStep: { value: new THREE.Vector2(0, 1 / gridSize) },
         uSigmaTexels: { value: sigmaTexels },
-        uInvNorm: { value: invNorm },
       },
     })
 

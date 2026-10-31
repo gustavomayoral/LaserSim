@@ -20,8 +20,31 @@ function formatMs(ms: number) {
   return `${ms.toFixed(1)} ms`
 }
 
+const MAX_LOG_LINES = 300
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const logRef = useRef<HTMLPreElement>(null)
+  const [logLines, setLogLines] = useState<string[]>([])
+
+  // Visible status log (user-requested: the app gave no feedback on what a
+  // long-running action — e.g. "Run benchmark" — was actually doing, which
+  // made a real failure indistinguishable from "still working"). Every
+  // multi-step action below logs its progress here instead of only setting
+  // a single status string at the end.
+  function log(message: string) {
+    const line = `[${new Date().toLocaleTimeString()}] ${message}`
+    setLogLines((prev) => {
+      const next = [...prev, line]
+      return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next
+    })
+  }
+
+  useEffect(() => {
+    const el = logRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [logLines])
+
   const sceneRef = useRef<HeightmapScene | null>(null)
   const pipelineRef = useRef<BurnSimPipeline | null>(null)
   const jobsRef = useRef<{ full: TestJob; coarse: TestJob } | null>(null)
@@ -66,15 +89,22 @@ function App() {
     // GPU/driver combination that may behave differently than the one this
     // was developed against, so failure here must be visible, not fatal.
     let scene: HeightmapScene | null = null
+    log("Initializing GPU scene...")
     try {
       scene = new HeightmapScene(canvasRef.current, SIZE_MM)
       sceneRef.current = scene
       const pipeline = new BurnSimPipeline(scene.renderer)
       pipelineRef.current = pipeline
-      setCaps(readGpuCapabilities(scene.renderer))
+      const gpuCaps = readGpuCapabilities(scene.renderer)
+      setCaps(gpuCaps)
+      log(`GPU: ${gpuCaps.renderer ?? "unknown"} (WebGL2: ${gpuCaps.isWebGL2})`)
+      log("Warming up shaders...")
       pipeline.warmup()
+      log("Ready.")
     } catch (err) {
-      setInitError(`Startup failed: ${err instanceof Error ? err.message : String(err)}`)
+      const message = `Startup failed: ${err instanceof Error ? err.message : String(err)}`
+      log(message)
+      setInitError(message)
     }
     if (!scene) return
 
@@ -180,6 +210,7 @@ function App() {
       statusRttWhileStreamingMs,
     }
     setIpcResults((prev) => [...prev.filter((r) => r.mode !== session.mode), result])
+    log(`IPC (${session.mode}): ${session.lineCount} lines, ${linesPerSec.toFixed(0)} lines/sec, p50=${p50.toFixed(2)}ms p95=${p95.toFixed(2)}ms`)
   }
 
   async function startBatchedIpcListener() {
@@ -187,6 +218,7 @@ function App() {
     setError(null)
     setIpcBusyMode("batched-events")
     const port = IPC_PORTS["batched-events"]
+    log(`IPC: listening for batched-events run on port ${port}...`)
     try {
       const { invoke } = await import("@tauri-apps/api/core")
       const { listen } = await import("@tauri-apps/api/event")
@@ -218,8 +250,10 @@ function App() {
         void finalizeIpcSession()
       })
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      log(`IPC batched-events listener FAILED: ${message}`)
       setIpcBusyMode(null)
-      setError(err instanceof Error ? err.message : String(err))
+      setError(message)
     }
   }
 
@@ -228,6 +262,7 @@ function App() {
     setError(null)
     setIpcBusyMode("channel")
     const port = IPC_PORTS.channel
+    log(`IPC: listening for channel run on port ${port}...`)
     try {
       const { invoke, Channel } = await import("@tauri-apps/api/core")
       ipcSessionRef.current = {
@@ -260,9 +295,11 @@ function App() {
       }
       await invoke("start_gcode_channel", { port, batchSize: IPC_BATCH_SIZE, channel })
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      log(`IPC channel listener FAILED: ${message}`)
       ipcSessionRef.current = null
       setIpcBusyMode(null)
-      setError(err instanceof Error ? err.message : String(err))
+      setError(message)
     }
   }
 
@@ -305,14 +342,18 @@ function App() {
   function runPass(kind: "full" | "coarse") {
     setBusy(true)
     setError(null)
+    log(`Running ${kind} pass...`)
     // Let the UI paint "busy" before the (synchronous, blocking) GPU work.
     requestAnimationFrame(() => {
       try {
         const summary = executePass(kind)
         if (kind === "full") setFullResult(summary)
         else setCoarseResult(summary)
+        log(`${kind} pass done: total ${summary.timings.totalMs.toFixed(1)} ms`)
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        const message = err instanceof Error ? err.message : String(err)
+        log(`${kind} pass FAILED: ${message}`)
+        setError(message)
       } finally {
         setBusy(false)
       }
@@ -334,20 +375,29 @@ function App() {
   function runBenchmark() {
     const scene = sceneRef.current
     const pipeline = pipelineRef.current
-    if (!scene || !pipeline || !caps) return
+    if (!scene || !pipeline || !caps) {
+      log("Run benchmark: ignored — scene/pipeline/capabilities aren't ready yet (wait for the GPU capabilities panel to finish probing).")
+      return
+    }
+    log("Run benchmark: starting...")
     setBenchBusy(true)
     setBenchStatus(null)
     setError(null)
     requestAnimationFrame(() => {
       try {
+        log("Running full-res pass...")
         const full = executePass("full")
+        log(`Full-res done: total ${full.timings.totalMs.toFixed(1)} ms`)
+        log("Running coarse-scrub pass...")
         const coarse = executePass("coarse")
+        log(`Coarse-scrub done: total ${coarse.timings.totalMs.toFixed(1)} ms`)
         setFullResult(full)
         setCoarseResult(coarse)
 
         // Warm/cold timing series (COD-252 §1/§2): separate from the
         // single display runs above so the heightmap preview still reflects
         // the last real run rather than a disposed timing-only one.
+        log("Running full-res timing series (1 cold + 10 warm runs)...")
         const fullSeries: TimingSeries = pipeline.runSeries(getJobs().full, {
           sizeMm: SIZE_MM,
           gridSize: full.gridSize,
@@ -356,6 +406,7 @@ function App() {
           rampScale: 600,
           ablationThreshold: 0.6,
         })
+        log("Running coarse-scrub timing series (1 cold + 10 warm runs)...")
         const coarseSeries: TimingSeries = pipeline.runSeries(getJobs().coarse, {
           sizeMm: SIZE_MM,
           gridSize: coarse.gridSize,
@@ -365,15 +416,18 @@ function App() {
           ablationThreshold: 0.6,
         })
 
+        log("Running CPU fallback deposit+blur on the full-res job (this can take several seconds)...")
         const fc = fullConfig()
         const cpuFallbackResult = runCpuFallbackBenchmark(getJobs().full, SIZE_MM, fc.gridSize, fc.spotSigmaMm, fc.heatSigmaMm)
         setCpuFallback(cpuFallbackResult)
+        log(`CPU fallback done: total ${cpuFallbackResult.totalMs.toFixed(1)} ms`)
 
         // Unsynced estimate of what real interactive scrubbing would cost
         // (COD-252 §2 discussion): the synced numbers above are correct for
         // the benchmark but pay a per-stage gl.finish()/readPixels cost real
         // interactive use wouldn't need. Disposed immediately; only its
         // timing matters here.
+        log("Running unsynced coarse-scrub estimate...")
         const coarseUnsynced = pipeline.run(
           getJobs().coarse,
           { sizeMm: SIZE_MM, gridSize: coarse.gridSize, spotSigmaMm: 0.05, heatSigmaMm: 0.03, rampScale: 600, ablationThreshold: 0.6 },
@@ -414,27 +468,43 @@ function App() {
         })
 
         if (tauriAvailable) {
+          log("Report built. Opening save dialog...")
           ;(async () => {
             try {
               const { invoke } = await import("@tauri-apps/api/core")
-              const path = await invoke<string>("write_benchmark_report", {
-                platform: detectPlatform(),
-                report,
+              const { save } = await import("@tauri-apps/plugin-dialog")
+              const defaultName = await invoke<string>("default_benchmark_report_name", { platform: detectPlatform() })
+              const chosenPath = await save({
+                defaultPath: defaultName,
+                filters: [{ name: "Text", extensions: ["txt"] }],
               })
+              if (!chosenPath) {
+                log("Save dialog cancelled — report not written.")
+                setBenchStatus("Save cancelled — report not written to disk.")
+                return
+              }
+              log(`Writing report to ${chosenPath}...`)
+              const path = await invoke<string>("write_benchmark_report", { path: chosenPath, report })
+              log(`Report written to ${path}`)
               setBenchStatus(`Report written to ${path}`)
             } catch (err) {
-              setBenchStatus(`Failed to write report: ${err instanceof Error ? err.message : String(err)}`)
+              const message = err instanceof Error ? err.message : String(err)
+              log(`Failed to write report: ${message}`)
+              setBenchStatus(`Failed to write report: ${message}`)
             } finally {
               setBenchBusy(false)
             }
           })()
         } else {
           console.log(report)
+          log("Not running inside Tauri — report logged to the browser console instead of written to disk.")
           setBenchStatus("Not running inside Tauri — report logged to the browser console instead of written to disk.")
           setBenchBusy(false)
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        const message = err instanceof Error ? err.message : String(err)
+        log(`Run benchmark FAILED: ${message}`)
+        setError(message)
         setBenchBusy(false)
       }
     })
@@ -443,15 +513,26 @@ function App() {
   function runMemorySweep() {
     const scene = sceneRef.current
     const pipeline = pipelineRef.current
-    if (!scene || !pipeline) return
+    if (!scene || !pipeline) {
+      log("Run memory/tiling sweep: ignored — scene/pipeline not ready yet.")
+      return
+    }
+    log("Run memory/tiling sweep: starting (100/150/200/250mm)...")
     setMemorySweepBusy(true)
     setError(null)
     requestAnimationFrame(() => {
       try {
         const steps = runMemoryTilingSweep(pipeline, scene.renderer)
         setMemorySweep(steps)
+        for (const step of steps) {
+          const status = step.contextLost ? "CONTEXT LOST" : step.success ? "OK" : "FAILED"
+          log(`  ${step.sizeMm}mm (grid ${step.gridSize}): ${status}${step.error ? ` — ${step.error}` : ""}`)
+        }
+        log("Memory/tiling sweep done.")
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        const message = err instanceof Error ? err.message : String(err)
+        log(`Memory/tiling sweep FAILED: ${message}`)
+        setError(message)
       } finally {
         setMemorySweepBusy(false)
       }
@@ -470,6 +551,13 @@ function App() {
         Tauri + WebGL2 burn-sim performance test: deposit (bilinear points, additive) → separable Gaussian blur →
         material ramp → three.js heightmap.
       </p>
+
+      <section className="panel">
+        <h2>Status log</h2>
+        <pre ref={logRef} className="status-log">
+          {logLines.length > 0 ? logLines.join("\n") : "(idle — nothing has run yet this session)"}
+        </pre>
+      </section>
 
       {initError && (
         <section className="panel">

@@ -79,6 +79,21 @@
   font-weight: 500;
 }
 
+.status-log {
+  background-color: #0f0f0f;
+  color: #d4f7d4;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  max-height: 14rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
 .canvas-panel {
   width: min(900px, 95vw);
 }

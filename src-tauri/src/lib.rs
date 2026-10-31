@@ -3,6 +3,7 @@ mod gcode_listener;
 mod ipc_bench;
 
 use std::io::Write;
+use tauri::Manager;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -30,22 +31,28 @@ fn append_session_log(line: String) -> Result<(), String> {
     writeln!(file, "{line}").map_err(|e| e.to_string())
 }
 
-// Default filename offered by the frontend's save dialog (App.tsx), kept
-// here too so both sides agree on the naming convention without the
-// frontend needing to duplicate the platform-sniffing/timestamp logic.
+// Default full path offered to the frontend's editable save-path field
+// (App.tsx) — Desktop plus a timestamped filename. Not a native save
+// dialog: tauri-plugin-dialog's save() hung indefinitely on at least one
+// real Windows/WebView2 machine (no dialog ever appeared, including after
+// checking the taskbar/Alt+Tab — not just an unfocused-window issue), so
+// the frontend uses a plain text input instead; this only computes the
+// starting value for it.
 #[tauri::command]
-fn default_benchmark_report_name(platform: String) -> Result<String, String> {
+fn default_benchmark_report_path(app: tauri::AppHandle) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
+    let desktop_dir = app.path().desktop_dir().map_err(|e| e.to_string())?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs();
-    Ok(format!("lasersim-bench-{platform}-{timestamp}.txt"))
+    let filename = format!("lasersim-bench-{timestamp}.txt");
+    Ok(desktop_dir.join(filename).to_string_lossy().into_owned())
 }
 
 // Writes a benchmark report (plain text, already formatted by the JS side)
-// to a path the user picked via the frontend's save dialog. Returns the
-// path written, for the UI to display.
+// to whatever path the frontend's editable save-path field currently holds.
+// Returns the path written, for the UI to display.
 #[tauri::command]
 fn write_benchmark_report(path: String, report: String) -> Result<String, String> {
     std::fs::write(&path, report).map_err(|e| e.to_string())?;
@@ -56,10 +63,9 @@ fn write_benchmark_report(path: String, report: String) -> Result<String, String
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             greet,
-            default_benchmark_report_name,
+            default_benchmark_report_path,
             write_benchmark_report,
             append_session_log,
             ipc_bench::start_gcode_batched,

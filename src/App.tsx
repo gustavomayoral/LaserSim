@@ -3,7 +3,7 @@ import { isTauri } from "@tauri-apps/api/core"
 import { buildTestJob, defaultJobParams, type TestJob } from "./sim/testJob"
 import { BurnSimPipeline, readGpuCapabilities, type GpuCapabilities } from "./sim/pipeline"
 import { HeightmapScene } from "./render/HeightmapScene"
-import { buildReportText, detectPlatform, type RunSummary, type TimingSeries } from "./bench/report"
+import { buildReportText, type RunSummary, type TimingSeries } from "./bench/report"
 import { runMemoryTilingSweep, type MemorySweepStep } from "./bench/memorySweep"
 import { runCpuFallbackBenchmark, type CpuFallbackResult } from "./bench/cpuFallback"
 import { IPC_PORTS, startStatusRttProbe, summarizeLatencies, type IpcMode, type IpcModeResult } from "./bench/ipcBench"
@@ -72,6 +72,12 @@ function App() {
 
   const [benchBusy, setBenchBusy] = useState(false)
   const [benchStatus, setBenchStatus] = useState<string | null>(null)
+  // Editable save path (text input, not a native dialog — tauri-plugin-
+  // dialog's save() hung indefinitely on at least one real Windows/WebView2
+  // machine, no dialog ever appeared even after checking the taskbar, so a
+  // plain field the user can read/edit themselves replaced it entirely).
+  const [savePath, setSavePath] = useState("")
+  const lastReportRef = useRef<string | null>(null)
 
   const [memorySweep, setMemorySweep] = useState<MemorySweepStep[] | null>(null)
   const [memorySweepBusy, setMemorySweepBusy] = useState(false)
@@ -192,6 +198,43 @@ function App() {
       rttProbe?.stop()
     }
   }, [tauriAvailable])
+
+  useEffect(() => {
+    if (!tauriAvailable) return
+    ;(async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core")
+        const defaultPath = await invoke<string>("default_benchmark_report_path")
+        setSavePath(defaultPath)
+      } catch (err) {
+        log(`Could not compute a default save path: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tauriAvailable])
+
+  async function saveReport() {
+    const report = lastReportRef.current
+    if (!report) {
+      log("Save report: nothing to save yet — run the benchmark first.")
+      return
+    }
+    if (!savePath) {
+      log("Save report: path is empty.")
+      return
+    }
+    log(`Writing report to ${savePath}...`)
+    try {
+      const { invoke } = await import("@tauri-apps/api/core")
+      const path = await invoke<string>("write_benchmark_report", { path: savePath, report })
+      log(`Report written to ${path}`)
+      setBenchStatus(`Report written to ${path}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      log(`Failed to write report: ${message}`)
+      setBenchStatus(`Failed to write report: ${message}`)
+    }
+  }
 
   const IPC_BATCH_SIZE = 256
 
@@ -476,34 +519,11 @@ function App() {
           coarseUnsyncedTotalMs: coarseUnsynced.timings.totalMs,
         })
 
+        lastReportRef.current = report
+
         if (tauriAvailable) {
-          log("Report built. Opening save dialog...")
-          ;(async () => {
-            try {
-              const { invoke } = await import("@tauri-apps/api/core")
-              const { save } = await import("@tauri-apps/plugin-dialog")
-              const defaultName = await invoke<string>("default_benchmark_report_name", { platform: detectPlatform() })
-              const chosenPath = await save({
-                defaultPath: defaultName,
-                filters: [{ name: "Text", extensions: ["txt"] }],
-              })
-              if (!chosenPath) {
-                log("Save dialog cancelled — report not written.")
-                setBenchStatus("Save cancelled — report not written to disk.")
-                return
-              }
-              log(`Writing report to ${chosenPath}...`)
-              const path = await invoke<string>("write_benchmark_report", { path: chosenPath, report })
-              log(`Report written to ${path}`)
-              setBenchStatus(`Report written to ${path}`)
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err)
-              log(`Failed to write report: ${message}`)
-              setBenchStatus(`Failed to write report: ${message}`)
-            } finally {
-              setBenchBusy(false)
-            }
-          })()
+          log("Report built. Writing to the save path shown below (edit it and click \"Save report\" to resave elsewhere)...")
+          void saveReport().finally(() => setBenchBusy(false))
         } else {
           console.log(report)
           log("Not running inside Tauri — report logged to the browser console instead of written to disk.")
@@ -607,9 +627,21 @@ function App() {
         <p className="note">
           Runs the full-res and coarse passes (single run, plus a 1-cold + 10-warm timing series per COD-252 §2),
           times the CPU fallback deposit+blur on the full-res job (§5), and writes a plain-text report (environment,
-          capabilities, timings, fluence conservation, memory/tiling, CPU fallback, IPC) to the Desktop. Memory/tiling
-          (§4) and IPC (§6) results are only included if you've run those panels below first in this session.
+          capabilities, timings, fluence conservation, memory/tiling, CPU fallback, IPC). Memory/tiling (§4) and IPC
+          (§6) results are only included if you've run those panels below first in this session.
         </p>
+        {tauriAvailable && (
+          <div className="row save-path-row">
+            <input
+              type="text"
+              value={savePath}
+              onChange={(e) => setSavePath(e.target.value)}
+              placeholder="Full path to save the report to"
+              className="save-path-input"
+            />
+            <button onClick={() => void saveReport()}>Save report</button>
+          </div>
+        )}
         {benchStatus && <p className="note">{benchStatus}</p>}
         {cpuFallback && (
           <p className="note">

@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod env_info;
 mod gcode_listener;
 mod ipc_bench;
 
@@ -46,7 +47,9 @@ fn default_benchmark_report_path(app: tauri::AppHandle) -> Result<String, String
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs();
-    let filename = format!("lasersim-bench-{timestamp}.txt");
+    // Platform in the name (COD-252 §1) so Windows and macOS reports sit
+    // side by side without renaming.
+    let filename = format!("lasersim-bench-{}-{timestamp}.txt", env_info::platform());
     Ok(desktop_dir.join(filename).to_string_lossy().into_owned())
 }
 
@@ -68,6 +71,7 @@ pub fn run() {
             default_benchmark_report_path,
             write_benchmark_report,
             append_session_log,
+            env_info::environment_info,
             ipc_bench::start_gcode_batched,
             ipc_bench::start_gcode_channel,
             ipc_bench::ping

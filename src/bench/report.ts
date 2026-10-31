@@ -17,8 +17,19 @@ export interface TimingSeries {
   warm: PassTimings[]
 }
 
+// From src-tauri's environment_info command (env_info.rs); null outside
+// Tauri or if the command failed.
+export interface EnvironmentInfo {
+  platform: string
+  arch: string
+  os: string | null
+  webview_version: string | null
+  commit: string | null
+}
+
 export interface BenchmarkInputs {
   caps: GpuCapabilities
+  environment: EnvironmentInfo | null
   full: RunSummary | null
   coarse: RunSummary | null
   expectedFluenceFull: number
@@ -41,6 +52,17 @@ export interface BenchmarkInputs {
 // Coarse platform label for the report filename/header. No OS plugin is wired
 // up yet (see COD-252 §1), so this is a best-effort UA sniff, not a real
 // capability check.
+// ANGLE renderer strings end in the backend, e.g.
+// "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+// or "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)".
+function angleBackend(renderer: string | null): string {
+  if (!renderer) return "unknown (renderer not exposed)"
+  if (!renderer.startsWith("ANGLE")) return "not ANGLE"
+  if (/Metal/i.test(renderer)) return "Metal"
+  const last = renderer.match(/,\s*([^,]+)\)\s*$/)?.[1]?.trim()
+  return last ?? "unknown"
+}
+
 export function detectPlatform(): string {
   const ua = navigator.userAgent
   if (/Windows/i.test(ua)) return "windows"
@@ -162,6 +184,7 @@ function seriesSection(label: string, series: TimingSeries | null): string {
 export function buildReportText(inputs: BenchmarkInputs): string {
   const {
     caps,
+    environment,
     full,
     coarse,
     expectedFluenceFull,
@@ -183,11 +206,17 @@ export function buildReportText(inputs: BenchmarkInputs): string {
   lines.push("")
 
   lines.push("== Environment ==")
-  lines.push(`platform (UA sniff): ${detectPlatform()}`)
+  const unavailable = environment ? "unavailable" : "unavailable (not running inside Tauri)"
+  lines.push(`platform: ${environment ? `${environment.platform} (${environment.arch})` : `${detectPlatform()} (UA sniff)`}`)
+  lines.push(`os: ${environment?.os ?? unavailable}`)
+  lines.push(`webview runtime: ${environment?.webview_version ?? unavailable}`)
   lines.push(`user agent: ${navigator.userAgent}`)
   lines.push(`gl renderer: ${caps.renderer ?? "unavailable (WEBGL_debug_renderer_info not exposed)"}`)
   lines.push(`gl vendor: ${caps.vendor ?? "unavailable (WEBGL_debug_renderer_info not exposed)"}`)
-  lines.push("app commit hash: TODO — not wired up yet (needs build-time env var)")
+  lines.push(`angle backend: ${angleBackend(caps.renderer)}`)
+  lines.push(
+    `app commit: ${environment?.commit ?? (environment ? "unknown (not running from a git checkout)" : unavailable)}`,
+  )
   lines.push("")
 
   lines.push("== Capabilities ==")

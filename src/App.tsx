@@ -5,7 +5,7 @@ import { BurnSimPipeline, readGpuCapabilities, stageTimes, type GpuCapabilities 
 import { resolveGpuTimes } from "./sim/gpuTimer"
 import { runCpuReference } from "./sim/cpuReference"
 import { HeightmapScene } from "./render/HeightmapScene"
-import { buildReportText, type RunSummary, type TimingSeries } from "./bench/report"
+import { buildReportText, type EnvironmentInfo, type RunSummary, type TimingSeries } from "./bench/report"
 import { runMemoryTilingSweep, type MemorySweepStep } from "./bench/memorySweep"
 import { runCpuFallbackBenchmark, type CpuFallbackResult } from "./bench/cpuFallback"
 import { IPC_PORTS, startStatusRttProbe, summarizeLatencies, type IpcMode, type IpcModeResult } from "./bench/ipcBench"
@@ -543,8 +543,22 @@ function App() {
         const expectedFluenceFull = expectedFluenceFor(getJobs().full.samples)
         const expectedFluenceCoarse = expectedFluenceFor(getJobs().coarse.samples)
 
+        // OS build, webview runtime version and commit come from Rust
+        // (env_info.rs) — the webview can't see them itself. A failure only
+        // costs those report lines, never the report.
+        let environment: EnvironmentInfo | null = null
+        if (tauriAvailable) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core")
+            environment = await invoke<EnvironmentInfo>("environment_info")
+          } catch (err) {
+            log(`Could not read environment info: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        }
+
         const report = buildReportText({
           caps,
+          environment,
           full,
           coarse,
           expectedFluenceFull,

@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 
+use crate::backpressure::Pacer;
+
 #[derive(Clone, Serialize)]
 pub struct GcodeBatch {
     pub seq_start: u64,
@@ -85,26 +87,30 @@ pub fn start_gcode_batched(app: AppHandle, port: u16, batch_size: usize) -> Resu
         let reader = BufReader::new(stream);
         let mut seq: u64 = 0;
         let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        // Batching keeps the message count low at the default batch size,
+        // but small batch sizes approach one message per line again.
+        let mut pacer = Pacer::new(app.clone());
         for line in reader.lines() {
             let Ok(line) = line else { break };
             seq += 1;
             batch.push(line);
             if batch.len() >= batch_size {
                 let seq_start = seq - batch.len() as u64 + 1;
-                let _ = app.emit(
+                pacer.sent(app.emit(
                     "gcode-batch",
                     GcodeBatch { seq_start, count: batch.len() as u32, lines: std::mem::take(&mut batch), rust_ms: now_ms() },
-                );
+                ));
             }
         }
         if !batch.is_empty() {
             let seq_start = seq - batch.len() as u64 + 1;
-            let _ = app.emit(
+            pacer.sent(app.emit(
                 "gcode-batch",
                 GcodeBatch { seq_start, count: batch.len() as u32, lines: batch, rust_ms: now_ms() },
-            );
+            ));
         }
         let _ = app.emit("gcode-batch-done", GcodeBatchDone { total: seq });
+        pacer.report("start_gcode_batched");
     });
     Ok(())
 }
@@ -113,31 +119,40 @@ pub fn start_gcode_batched(app: AppHandle, port: u16, batch_size: usize) -> Resu
 /// Channel (passed in from the frontend's invoke call) instead of a global
 /// `app.emit`, so the two IPC transports can be compared directly.
 #[tauri::command]
-pub fn start_gcode_channel(port: u16, batch_size: usize, channel: Channel<GcodeBatch>) -> Result<(), String> {
+pub fn start_gcode_channel(
+    app: AppHandle,
+    port: u16,
+    batch_size: usize,
+    channel: Channel<GcodeBatch>,
+) -> Result<(), String> {
     let listener = bind_once(port)?;
     let batch_size = batch_size.max(1);
     serve_one_run(listener, port, move |stream| {
         let reader = BufReader::new(stream);
         let mut seq: u64 = 0;
         let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        // Channel messages go through the same UI-thread queue as events
+        // (batch size 1 wedged IPC exactly like per-line emits did).
+        let mut pacer = Pacer::new(app);
         for line in reader.lines() {
             let Ok(line) = line else { break };
             seq += 1;
             batch.push(line);
             if batch.len() >= batch_size {
                 let seq_start = seq - batch.len() as u64 + 1;
-                let _ = channel.send(GcodeBatch {
+                pacer.sent(channel.send(GcodeBatch {
                     seq_start,
                     count: batch.len() as u32,
                     lines: std::mem::take(&mut batch),
                     rust_ms: now_ms(),
-                });
+                }));
             }
         }
         if !batch.is_empty() {
             let seq_start = seq - batch.len() as u64 + 1;
-            let _ = channel.send(GcodeBatch { seq_start, count: batch.len() as u32, lines: batch, rust_ms: now_ms() });
+            pacer.sent(channel.send(GcodeBatch { seq_start, count: batch.len() as u32, lines: batch, rust_ms: now_ms() }));
         }
+        pacer.report("start_gcode_channel");
         // Channel has no separate "done" event type, so send a
         // zero-count sentinel the frontend can use to know the
         // stream ended (mirrors gcode-batch-done for the event path).

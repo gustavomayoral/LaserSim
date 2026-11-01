@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod backpressure;
 mod env_info;
 mod gcode_listener;
 mod ipc_bench;

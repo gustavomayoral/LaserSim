@@ -11,6 +11,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
+use crate::backpressure::Pacer;
+
 pub const DEFAULT_PORT: u16 = 8090;
 
 #[derive(Clone, Serialize)]
@@ -54,20 +56,24 @@ pub fn spawn(app: AppHandle, port: u16) {
             thread::spawn(move || {
                 let reader = BufReader::new(stream);
                 let seq = AtomicU64::new(0);
+                // One event per line is exactly the load that overflowed the
+                // UI thread's message queue and wedged IPC — see backpressure.rs.
+                let mut pacer = Pacer::new(app.clone());
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
                     let n = seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    let _ = app.emit(
+                    pacer.sent(app.emit(
                         "gcode-line",
                         GcodeLine {
                             seq: n,
                             line,
                             rust_ms: now_ms(),
                         },
-                    );
+                    ));
                 }
                 let total = seq.load(Ordering::Relaxed);
                 let _ = app.emit("gcode-done", GcodeDone { seq: total });
+                pacer.report("gcode_listener");
             });
         }
     });
